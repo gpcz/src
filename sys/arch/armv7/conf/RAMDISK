@@ -56,6 +56,9 @@ imxahci*	at fdt?			# AHCI/SATA
 imxehci*	at fdt?			# EHCI
 usb*		at imxehci?
 
+# Atmel
+atmlaic*	at fdt?                 # interrupt controller
+
 # OMAP3xxx/OMAP4xxx SoC
 omap0		at mainbus?
 omapid*		at omap?

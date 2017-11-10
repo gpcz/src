@@ -1,0 +1,3 @@
+device atmlaic
+attach atmlaic at fdt
+file	arch/armv7/atmel/atmlaic.c			atmlaic
