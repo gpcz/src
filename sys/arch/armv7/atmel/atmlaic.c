@@ -18,6 +18,7 @@
 #include <sys/device.h>
 
 struct atmlaic_softc {
+	struct device		sc_dev;
 };
 
 int		atmlaic_match(struct device *, void *, void*);
