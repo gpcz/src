@@ -82,7 +82,7 @@ include "arch/armv7/exynos/files.exynos"
 include "arch/armv7/vexpress/files.vexpress"
 include "arch/armv7/broadcom/files.broadcom"
 include "arch/armv7/marvell/files.marvell"
-include "arch/armv7/atmel/file.atmel"
+include "arch/armv7/atmel/files.atmel"
 
 # Console related stuff
 attach	com at fdt with com_fdt
