@@ -17,9 +17,7 @@
 #include <sys/param.h>
 #include <sys/device.h>
 
-#include <machine/fdt.h>
-
-#include <dev/ofw/fdt.h>
+#include <dev/ofw/openfirm.h>
 
 struct atmlaic_softc {
 	struct device		sc_dev;
