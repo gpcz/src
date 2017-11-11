@@ -17,6 +17,8 @@
 #include <sys/param.h>
 #include <sys/device.h>
 
+#include <machine/fdt.h>
+
 struct atmlaic_softc {
 	struct device		sc_dev;
 };
