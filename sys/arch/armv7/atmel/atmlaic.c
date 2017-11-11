@@ -20,6 +20,9 @@
 struct atmlaic_softc {
 };
 
+int		atmlaic_match(struct device *, void *, void*);
+int		atmlaic_attach(struct device *, struct device *, void*);
+
 struct cfattach atmlaic_ca = {
 	sizeof (struct atmlaic_softc), atmlaic_match, atmlaic_attach
 };
