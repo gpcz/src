@@ -19,6 +19,8 @@
 
 #include <machine/fdt.h>
 
+#include <dev/ofw/fdt.h>
+
 struct atmlaic_softc {
 	struct device		sc_dev;
 };
