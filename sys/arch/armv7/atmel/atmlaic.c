@@ -21,6 +21,12 @@
 
 #include <dev/ofw/openfirm.h>
 
+#define AIC_SSR			0x000 /* Source Select Register */
+#define AIC_SMR			0x004 /* Source Mode Register */
+#define AIC_SVR			0x008 /* Source Vector Register */
+#define AIC_IDCR		0x044 /* Interrupt Disable Command Register */
+/******************************************************************************/
+
 struct atmlaic_softc {
 	struct device		sc_dev;
 };
@@ -41,8 +47,7 @@ atmlaic_match(struct device *parent, void *cfdata, void *aux)
 {
 	struct fdt_attach_args *faa = aux;
 
-	return OF_is_compatible(faa->fa_node,
-	    "atmel,sama5d3-aic");
+	return OF_is_compatible(faa->fa_node, "atmel,sama5d3-aic");
 }
 
 void
