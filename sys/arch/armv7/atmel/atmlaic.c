@@ -15,12 +15,14 @@
  */
 
 #include <sys/param.h>
+#include <sys/systm.h>
 #include <sys/device.h>
 
 #include <machine/bus.h>
 #include <machine/fdt.h>
 
 #include <dev/ofw/openfirm.h>
+#include <dev/ofw/fdt.h>
 
 #define AIC_SSR			0x000 /* Source Select Register */
 #define AIC_SMR			0x004 /* Source Mode Register */
