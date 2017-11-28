@@ -65,7 +65,7 @@ atmlaic_attach(struct device *parent, struct device *self, void *args)
 	struct atmlaic_softc *sc = (struct atmlaic_softc *)self;
 	struct fdt_attach_args *faa = args;
 
-	if (faa->nreg != 1)
+	if (faa->fa_nreg != 1)
 		panic("%s: number of atmlaic registers != 1!", __func__);
 	sc->sc_node = faa->fa_node;
 	sc->sc_iot = faa->fa_iot;
