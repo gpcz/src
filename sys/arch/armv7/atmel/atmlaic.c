@@ -39,7 +39,7 @@ struct atmlaic_softc {
 int		 atmlaic_match(struct device *, void *, void*);
 void		 atmlaic_attach(struct device *, struct device *, void*);
 void		*atmlaic_intr_establish(void *, int *, int,
-		    int (*)(void 8), void *, char *);
+		    int (*)(void *), void *, char *);
 
 struct cfattach atmlaic_ca = {
 	sizeof (struct atmlaic_softc), atmlaic_match, atmlaic_attach
