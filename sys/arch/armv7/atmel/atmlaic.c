@@ -84,4 +84,6 @@ void *
 atmlaic_intr_establish(void *cookie, int *cells, int level,
     int (*func)(void *), void *arg, char *name)
 {
+	struct intrhand		*ih = NULL;
+	return ih;
 }
