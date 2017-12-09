@@ -32,6 +32,7 @@
 #define AIC_SSR			0x000 /* Source Select Register */
 #define AIC_SMR			0x004 /* Source Mode Register */
 #define AIC_SVR			0x008 /* Source Vector Register */
+#define AIC_ISR			0x018 /* Interrupt Status Register */
 #define AIC_EOICR		0x038 /* End of Interrupt Command Register*/
 #define AIC_SPU			0x03C /* Spurious Interrupt Vector Register */
 #define AIC_IDCR		0x044 /* Interrupt Disable Command Register */
@@ -90,6 +91,10 @@ atmlaic_attach(struct device *parent, struct device *self, void *args)
 		panic("%s: bus_space_map failed!", __func__);
 
 	/*
+	 * Disable and clear all interrupts.
+	 */
+
+	/*
 	 * Set up the spurious interrupt service routine and make an
 	 * evcount to track how often spurious interrupts happen.
 	 */
@@ -121,9 +126,13 @@ atmlaic_intr_disestablish(void *cookie)
 void
 atmlaic_intr(void)
 {
-	/* Get the IRQ number from the AIC. */
+	unsigned int irq;
+	/* Get the IRQ number for the current interrupt. */
+	irq = bus_space_read_4(sc->sc_iot, sc->sc_ioh, AIC_ISR);
+
 	/* Get the interrupt information from the array. */
 	/* Call the interrupt function and increment evcount if return > 0. */
+
 	/*
 	 * Set the End of Interrupt register.  This jumps us back to what we
 	 * were doing.
