@@ -44,6 +44,14 @@
 #define AIC_IECR		0x040 /* Interrupt Enable Command Register */
 #define AIC_IDCR		0x044 /* Interrupt Disable Command Register */
 #define AIC_ICCR		0x048 /* Interrupt Clear Command Register */
+
+/* IRQ bindings from DTSI */
+#define FDT_IRQ_TYPE_NONE		0
+#define FDT_IRQ_TYPE_EDGE_RISING	1
+#define FDT_IRQ_TYPE_EDGE_FALLING	2
+#define FDT_IRQ_TYPE_EDGE_BOTH		3
+#define FDT_IRQ_TYPE_LEVEL_HIGH		4
+#define FDT_IRQ_TYPE_LEVEL_LOW		8
 /******************************************************************************/
 
 struct atmlaic_softc {
@@ -215,6 +223,7 @@ atmlaic_intr_establish(void *cookie, int *cells, int level,
 	struct intrhand		*ih = NULL;
 	int			 irqno = cells[0];
 	int			 psw;
+	u_int32_t		 source_mode;
 
 	if (irqno < 0 || irqno >= AIC_NIRQ)
 		panic("%s: bogus irqnumber %d: %s", __func__,
@@ -244,6 +253,10 @@ atmlaic_intr_establish(void *cookie, int *cells, int level,
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_SPU,
 	    (u_int32_t)atmlaic_intr);
 	/* TODO: Set priority and trigger. */
+	if (sc->sc_intc.ic_cells == 1)
+		source_mode = AIC_SMR_INT_LEVEL_SENSITIVE;
+	else
+		
 	/* Clear the interrupt. */
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_ICCR, 1);
 
@@ -282,8 +295,10 @@ atmlaic_intr(void)
 	/* Get the IRQ number for the current interrupt. */
 	irq = bus_space_read_4(sc->sc_iot, sc->sc_ioh, AIC_ISR) & 0x7F;
 
-	/* Get the interrupt information from the array. */
-	/* Call the interrupt function and increment evcount if return > 0. */
+	/*
+	 * Get the interrupt information from the array.
+	 * Call the interrupt function and increment evcount if return > 0.
+	 */
 	if ((ih = sc->sc_handlers[irq]) != NULL) {
 		s = splraise(ih->ih_ipl);
 		if (ih->ih_func(ih->ih_arg))
