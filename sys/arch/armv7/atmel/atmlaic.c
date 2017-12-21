@@ -62,6 +62,8 @@ struct atmlaic_softc {
 	struct evcount		 	  sc_spur;
 	struct interrupt_controller 	  sc_intc;
 	struct intrhand			**sc_handlers;
+	int				  sc_n_externals;
+	u_int32_t			 *sc_externals;
 };
 struct atmlaic_softc *atml_intc = NULL;
 
@@ -78,6 +80,9 @@ int		 atmlaic_match(struct device *, void *, void*);
 void		 atmlaic_attach(struct device *, struct device *, void*);
 void		 atmlaic_intr_enable(struct atmlaic_softc *, int);
 void		 atmlaic_intr_enable(struct atmlaic_softc *, int);
+int		 atmlaic_ipl_to_priority(int);
+uint32_t	 atmlaic_convert_trigger(int, int);
+int		 atmlaic_is_irq_external(int, struct atmlaic_softc *);
 void		*atmlaic_intr_establish(void *, int *, int,
 		    int (*)(void *), void *, char *);
 void		 atmlaic_intr_disestablish(void *cookie);
@@ -105,7 +110,7 @@ atmlaic_attach(struct device *parent, struct device *self, void *args)
 {
 	struct atmlaic_softc *sc = (struct atmlaic_softc *)self;
 	struct fdt_attach_args *faa = args;
-	int i;
+	int i, len;
 
 	atml_intc = sc;
 
@@ -139,6 +144,18 @@ atmlaic_attach(struct device *parent, struct device *self, void *args)
 	/* Prepare all interrupt handle pointers and set them to NULL. */
 	sc->sc_handlers = mallocarray(AIC_NIRQ,
 	    sizeof(*sc->sc_handlers), M_DEVBUF, M_ZERO | M_NOWAIT);
+
+	sc->sc_n_externals = 0;
+	sc->sc_externals = NULL;
+	/* Get the list of external interrupts from the device tree. */
+	len = OF_getproplen(sc->sc_node, "atmel,external-irqs");
+	if (len > 0 && (len % sizeof(u_int32_t)) == 0)
+	{
+		sc->sc_n_externals = len / sizeof(u_int32_t);
+		sc->sc_externals = malloc(len, M_DEVBUF, M_WAITOK);
+		OF_getpropintarray(sc->sc_node, "atmel,external-irqs",
+		    sc->sc_externals, len);
+	}
 
 	/* Register this driver as an interrupt controller to the OS. */
 	sc->sc_intc.ic_node = faa->fa_node;
@@ -209,10 +226,55 @@ atmlaic_ipl_to_priority(int ipl)
 /*
  *  Converts an interrupt trigger value from the device tree
  *  specification to one used by the Source Mode Register.
+ *
+ *  fdt_trigger_val: Raw trigger type code from the Device Tree
+ *         external: 0 if internal IRQ, nonzero if external IRQ.
+ *
+ *  Return value is the numeric code to place in the Source Mode Register.
  */
 u_int32_t
-atmlaic_convert_trigger(int trigger_val)
+atmlaic_convert_trigger(int fdt_trigger_val, int external)
 {
+	switch (fdt_trigger_val)
+	{
+	case FDT_IRQ_TYPE_NONE:
+		printf(": can't set irq trigger to 'none'. using level sensitive.");
+		return AIC_SMR_INT_LEVEL_SENSITIVE;
+	case FDT_IRQ_TYPE_EDGE_BOTH:
+		printf(": can't set irq trigger to 'edge both'.  using rising.");
+	case FDT_IRQ_TYPE_EDGE_RISING:
+		return AIC_SMR_EXT_POSITIVE_EDGE;
+	case FDT_IRQ_TYPE_EDGE_FALLING:
+		if (external == 0)
+			printf(": can't set internal irq to falling.  using rising.");
+		return AIC_SMR_INT_EDGE_TRIGGERED;
+	case FDT_IRQ_TYPE_LEVEL_HIGH:
+		if (external == 0)
+			return AIC_SMR_INT_LEVEL_SENSITIVE;
+		return AIC_SMR_EXT_HIGH_LEVEL;
+	case FDT_IRQ_TYPE_LEVEL_LOW:
+		if (external == 0)
+			printf(": can't set internal irq to low. using high.");
+		return AIC_SMR_INT_LEVEL_SENSITIVE;
+	}
+	/* Return the most common code if we hit an undefined answer. */
+	return AIC_SMR_INT_LEVEL_SENSITIVE;
+}
+
+/*
+ *  Return 0 if the irq number is an internal interrupt.
+ *  Return 1 if the irq number is an external interrupt.
+ */
+int
+atmlaic_is_irq_external(int irq, struct atmlaic_softc *sc)
+{
+	int i;
+	if (!sc || sc->sc_n_externals == 0 || !sc->sc_externals)
+		return 0;
+	for (i = 0; i < sc->sc_n_externals; i++)
+		if (irq == sc->sc_externals[i])
+			return 1;
+	return 0;
 }
 
 void *
@@ -252,16 +314,16 @@ atmlaic_intr_establish(void *cookie, int *cells, int level,
 	/* Set ISR to atmlaic_intr(). */
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_SPU,
 	    (u_int32_t)atmlaic_intr);
-	/* TODO: Set priority and trigger. */
-	if (sc->sc_intc.ic_cells == 1)
-		source_mode = AIC_SMR_INT_LEVEL_SENSITIVE;
-	else
-		
+	/* Set priority and trigger. */
+	source_mode = atmlaic_convert_trigger(irqno, atmlaic_is_irq_external(irqno));
+	source_mode += atmlaic_ipl_to_priority(level);
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_SMR, source_mode);
+
 	/* Clear the interrupt. */
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_ICCR, 1);
 
 	atmlaic_intr_enable(sc, irqno);
-	
+
 	restore_interrupts(psw);
 	return ih;
 }
