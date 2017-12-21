@@ -52,7 +52,6 @@
 #define FDT_IRQ_TYPE_EDGE_BOTH		3
 #define FDT_IRQ_TYPE_LEVEL_HIGH		4
 #define FDT_IRQ_TYPE_LEVEL_LOW		8
-/******************************************************************************/
 
 struct atmlaic_softc {
 	struct device			  sc_dev;
