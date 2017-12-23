@@ -78,7 +78,7 @@ struct intrhand {
 int		 atmlaic_match(struct device *, void *, void*);
 void		 atmlaic_attach(struct device *, struct device *, void*);
 void		 atmlaic_intr_enable(struct atmlaic_softc *, int);
-void		 atmlaic_intr_enable(struct atmlaic_softc *, int);
+void		 atmlaic_intr_disable(struct atmlaic_softc *, int);
 int		 atmlaic_ipl_to_priority(int);
 uint32_t	 atmlaic_convert_trigger(int, int);
 int		 atmlaic_is_irq_external(int, struct atmlaic_softc *);
@@ -215,7 +215,6 @@ atmlaic_ipl_to_priority(int ipl)
 	case IPL_CLOCK:
 	case IPL_STATCLOCK:
 	case IPL_SCHED:
-	case IPL_HIGH:
 		return 7;
 		break;
 	}
