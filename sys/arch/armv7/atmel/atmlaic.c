@@ -24,6 +24,7 @@
 #include <sys/evcount.h>
 
 #include <machine/bus.h>
+#include <machine/cpufunc.h>
 #include <machine/fdt.h>
 #include <machine/intr.h>
 
