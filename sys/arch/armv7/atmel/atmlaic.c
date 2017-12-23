@@ -314,7 +314,8 @@ atmlaic_intr_establish(void *cookie, int *cells, int level,
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_SPU,
 	    (u_int32_t)atmlaic_intr);
 	/* Set priority and trigger. */
-	source_mode = atmlaic_convert_trigger(irqno, atmlaic_is_irq_external(irqno));
+	source_mode = atmlaic_convert_trigger(irqno,
+	    atmlaic_is_irq_external(irqno, sc));
 	source_mode += atmlaic_ipl_to_priority(level);
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_SMR, source_mode);
 
@@ -371,12 +372,14 @@ atmlaic_intr(void)
 	 * Set the End of Interrupt register.  This jumps us back to what we
 	 * were doing.
 	 */
-	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_EOICR, i);
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_EOICR, 1);
 }
 
 void
 atmlaic_spur_intr(void)
 {
+	struct atmlaic_softc 	*sc = atml_intc;
+
 	/* Increment the spurious interrupt counter. */
 	sc->sc_spur.ec_count++;
 	
@@ -384,5 +387,5 @@ atmlaic_spur_intr(void)
 	 * Set the End of Interrupt register.  This jumps us back to what we
 	 * were doing.
 	 */
-	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_EOICR, i);
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, AIC_EOICR, 1);
 }
