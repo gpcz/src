@@ -23,8 +23,8 @@
 #include <sys/device.h>
 #include <sys/evcount.h>
 
+#include <arm/cpufunc.h>
 #include <machine/bus.h>
-#include <machine/cpufunc.h>
 #include <machine/fdt.h>
 #include <machine/intr.h>
 
