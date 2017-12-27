@@ -1,4 +1,4 @@
-/* $OpenBSD: ike_quick_mode.c,v 1.110 2015/12/10 17:27:00 mmcc Exp $	 */
+/* $OpenBSD: ike_quick_mode.c,v 1.112 2017/12/07 11:44:02 mpi Exp $	 */
 /* $EOM: ike_quick_mode.c,v 1.139 2001/01/26 10:43:17 niklas Exp $	 */
 
 /*
@@ -406,6 +406,7 @@ initiator_send_HASH_SA_NONCE(struct message *msg)
 	struct constant_map *id_map;
 	char           *protocol_id, *transform_id;
 	char           *local_id, *remote_id;
+	char           *name;
 	int             group_desc = -1, new_group_desc;
 	struct ipsec_sa *isa = msg->isakmp_sa->data;
 	struct hash    *hash = hash_get(isa->hash);
@@ -621,9 +622,40 @@ initiator_send_HASH_SA_NONCE(struct message *msg)
 					}
 					conf_free_list(life_conf);
 				}
-				attribute_set_constant(xf->field,
-				    "ENCAPSULATION_MODE", ipsec_encap_cst,
-				    IPSEC_ATTR_ENCAPSULATION_MODE, &attr);
+
+				if (proto_id == IPSEC_PROTO_IPSEC_ESP &&
+				    (exchange->flags &
+				    EXCHANGE_FLAG_NAT_T_ENABLE)) {
+					name = conf_get_str(xf->field,
+					    "ENCAPSULATION_MODE");
+					if (name) {
+						value = constant_value(
+						    ipsec_encap_cst,
+						    name);
+						switch (value) {
+						case IPSEC_ENCAP_TUNNEL:
+							value = exchange->flags & EXCHANGE_FLAG_NAT_T_DRAFT ?
+							    IPSEC_ENCAP_UDP_ENCAP_TUNNEL_DRAFT :
+							    IPSEC_ENCAP_UDP_ENCAP_TUNNEL;
+							break;
+						case IPSEC_ENCAP_TRANSPORT:
+							value = exchange->flags & EXCHANGE_FLAG_NAT_T_DRAFT ?
+							    IPSEC_ENCAP_UDP_ENCAP_TRANSPORT_DRAFT :
+							    IPSEC_ENCAP_UDP_ENCAP_TRANSPORT;
+							break;
+						}
+						attr = attribute_set_basic(
+						    attr,
+						    IPSEC_ATTR_ENCAPSULATION_MODE,
+						    value);
+					}
+				} else {
+					attribute_set_constant(xf->field,
+					    "ENCAPSULATION_MODE",
+					    ipsec_encap_cst,
+					    IPSEC_ATTR_ENCAPSULATION_MODE,
+					    &attr);
+				}
 
 				if (proto_id != IPSEC_PROTO_IPCOMP) {
 					attribute_set_constant(xf->field,
@@ -1398,9 +1430,9 @@ post_quick_mode(struct message *msg)
 						LOG_DBG_BUF((LOG_NEGOTIATION,
 						    90, "post_quick_mode: "
 						    "g^xy", ie->g_xy,
-						    ie->g_x_len));
+						    ie->g_xy_len));
 						prf->Update(prf->prfctx,
-						    ie->g_xy, ie->g_x_len);
+						    ie->g_xy, ie->g_xy_len);
 					}
 					LOG_DBG((LOG_NEGOTIATION, 90,
 					    "post_quick_mode: "
@@ -1902,10 +1934,11 @@ gen_g_xy(struct message *msg)
 	struct ipsec_exch *ie = exchange->data;
 
 	/* Compute Diffie-Hellman shared value.  */
-	ie->g_xy = malloc(ie->g_x_len);
+	ie->g_xy_len = dh_secretlen(ie->group);
+	ie->g_xy = malloc(ie->g_xy_len);
 	if (!ie->g_xy) {
 		log_error("gen_g_xy: malloc (%lu) failed",
-		    (unsigned long)ie->g_x_len);
+		    (unsigned long)ie->g_xy_len);
 		return;
 	}
 	if (dh_create_shared(ie->group, ie->g_xy,
@@ -1914,7 +1947,7 @@ gen_g_xy(struct message *msg)
 		return;
 	}
 	LOG_DBG_BUF((LOG_NEGOTIATION, 80, "gen_g_xy: g^xy", ie->g_xy,
-	    ie->g_x_len));
+	    ie->g_xy_len));
 }
 
 static int

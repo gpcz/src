@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_input.c,v 1.323 2017/10/09 08:35:38 mpi Exp $	*/
+/*	$OpenBSD: ip_input.c,v 1.335 2017/12/04 13:40:34 bluhm Exp $	*/
 /*	$NetBSD: ip_input.c,v 1.30 1996/03/16 23:53:58 christos Exp $	*/
 
 /*
@@ -84,22 +84,6 @@
 #include <netinet/ip_carp.h>
 #endif
 
-int encdebug = 0;
-int ipsec_keep_invalid = IPSEC_DEFAULT_EMBRYONIC_SA_TIMEOUT;
-int ipsec_require_pfs = IPSEC_DEFAULT_PFS;
-int ipsec_soft_allocations = IPSEC_DEFAULT_SOFT_ALLOCATIONS;
-int ipsec_exp_allocations = IPSEC_DEFAULT_EXP_ALLOCATIONS;
-int ipsec_soft_bytes = IPSEC_DEFAULT_SOFT_BYTES;
-int ipsec_exp_bytes = IPSEC_DEFAULT_EXP_BYTES;
-int ipsec_soft_timeout = IPSEC_DEFAULT_SOFT_TIMEOUT;
-int ipsec_exp_timeout = IPSEC_DEFAULT_EXP_TIMEOUT;
-int ipsec_soft_first_use = IPSEC_DEFAULT_SOFT_FIRST_USE;
-int ipsec_exp_first_use = IPSEC_DEFAULT_EXP_FIRST_USE;
-int ipsec_expire_acquire = IPSEC_DEFAULT_EXPIRE_ACQUIRE;
-char ipsec_def_enc[20];
-char ipsec_def_auth[20];
-char ipsec_def_comp[20];
-
 /* values controllable via sysctl */
 int	ipforwarding = 0;
 int	ipmforwarding = 0;
@@ -167,7 +151,7 @@ void save_rte(struct mbuf *, u_char *, struct in_addr);
 void
 ip_init(void)
 {
-	struct protosw *pr;
+	const struct protosw *pr;
 	int i;
 	const u_int16_t defbaddynamicports_tcp[] = DEFBADDYNAMICPORTS_TCP;
 	const u_int16_t defbaddynamicports_udp[] = DEFBADDYNAMICPORTS_UDP;
@@ -211,11 +195,11 @@ ip_init(void)
 	for (i = 0; defrootonlyports_udp[i] != 0; i++)
 		DP_SET(rootonlyports.udp, defrootonlyports_udp[i]);
 
-	strlcpy(ipsec_def_enc, IPSEC_DEFAULT_DEF_ENC, sizeof(ipsec_def_enc));
-	strlcpy(ipsec_def_auth, IPSEC_DEFAULT_DEF_AUTH, sizeof(ipsec_def_auth));
-	strlcpy(ipsec_def_comp, IPSEC_DEFAULT_DEF_COMP, sizeof(ipsec_def_comp));
-
 	mq_init(&ipsend_mq, 64, IPL_SOFTNET);
+
+#ifdef IPSEC
+	ipsec_init();
+#endif
 }
 
 /*
@@ -482,8 +466,6 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
 	if (ipsec_in_use) {
 		int rv;
 
-		KERNEL_ASSERT_LOCKED();
-
 		rv = ipsec_forward_check(m, hlen, AF_INET);
 		if (rv != 0) {
 			ipstat_inc(ips_cantforward);
@@ -631,13 +613,11 @@ ip_local(struct mbuf **mp, int *offp, int nxt, int af)
 int
 ip_deliver(struct mbuf **mp, int *offp, int nxt, int af)
 {
-	struct protosw *psw;
+	const struct protosw *psw;
 	int naf = af;
 #ifdef INET6
 	int nest = 0;
 #endif /* INET6 */
-
-	KERNEL_ASSERT_LOCKED();
 
 	/* pf might have modified stuff, might have to chksum */
 	switch (af) {
@@ -1041,20 +1021,6 @@ ip_slowtimo(void)
 }
 
 /*
- * Drain off all datagram fragments.
- */
-void
-ip_drain(void)
-{
-	mtx_enter(&ipq_mutex);
-	while (!LIST_EMPTY(&ipq)) {
-		ipstat_inc(ips_fragdropped);
-		ip_freef(LIST_FIRST(&ipq));
-	}
-	mtx_leave(&ipq_mutex);
-}
-
-/*
  * Flush a bunch of datagram fragments, till we are down to 75%.
  */
 void
@@ -1418,7 +1384,7 @@ ip_stripoptions(struct mbuf *m)
 	ip->ip_len = htons(ntohs(ip->ip_len) - olen);
 }
 
-int inetctlerrmap[PRC_NCMDS] = {
+const int inetctlerrmap[PRC_NCMDS] = {
 	0,		0,		0,		0,
 	0,		EMSGSIZE,	EHOSTDOWN,	EHOSTUNREACH,
 	EHOSTUNREACH,	EHOSTUNREACH,	ECONNREFUSED,	ECONNREFUSED,
@@ -1655,26 +1621,25 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 					      ip_mtudisc_timeout);
 		NET_UNLOCK();
 		return (error);
+#ifdef IPSEC
+	case IPCTL_ENCDEBUG:
+	case IPCTL_IPSEC_EXPIRE_ACQUIRE:
+	case IPCTL_IPSEC_EMBRYONIC_SA_TIMEOUT:
+	case IPCTL_IPSEC_REQUIRE_PFS:
+	case IPCTL_IPSEC_SOFT_ALLOCATIONS:
+	case IPCTL_IPSEC_ALLOCATIONS:
+	case IPCTL_IPSEC_SOFT_BYTES:
+	case IPCTL_IPSEC_BYTES:
+	case IPCTL_IPSEC_TIMEOUT:
+	case IPCTL_IPSEC_SOFT_TIMEOUT:
+	case IPCTL_IPSEC_SOFT_FIRSTUSE:
+	case IPCTL_IPSEC_FIRSTUSE:
 	case IPCTL_IPSEC_ENC_ALGORITHM:
-		NET_LOCK();
-		error = sysctl_tstring(oldp, oldlenp, newp, newlen,
-				       ipsec_def_enc, sizeof(ipsec_def_enc));
-		NET_UNLOCK();
-		return (error);
 	case IPCTL_IPSEC_AUTH_ALGORITHM:
-		NET_LOCK();
-		error = sysctl_tstring(oldp, oldlenp, newp, newlen,
-				       ipsec_def_auth,
-				       sizeof(ipsec_def_auth));
-		NET_UNLOCK();
-		return (error);
 	case IPCTL_IPSEC_IPCOMP_ALGORITHM:
-		NET_LOCK();
-		error = sysctl_tstring(oldp, oldlenp, newp, newlen,
-				       ipsec_def_comp,
-				       sizeof(ipsec_def_comp));
-		NET_UNLOCK();
-		return (error);
+		return (ipsec_sysctl(name, namelen, oldp, oldlenp, newp,
+		    newlen));
+#endif
 	case IPCTL_IFQUEUE:
 		return (sysctl_niq(name + 1, namelen - 1,
 		    oldp, oldlenp, newp, newlen, &ipintrq));
@@ -1804,12 +1769,15 @@ ip_savecontrol(struct inpcb *inp, struct mbuf **mp, struct ip *ip,
 	}
 	if (inp->inp_flags & INP_RECVRTABLE) {
 		u_int rtableid = inp->inp_rtableid;
-#if NPF > 0
-		struct pf_divert *divert;
 
-		if (m && m->m_pkthdr.pf.flags & PF_TAG_DIVERTED &&
-		    (divert = pf_find_divert(m)) != NULL)
+#if NPF > 0
+		if (m && m->m_pkthdr.pf.flags & PF_TAG_DIVERTED) {
+			struct pf_divert *divert;
+
+			divert = pf_find_divert(m);
+			KASSERT(divert != NULL);
 			rtableid = divert->rdomain;
+		}
 #endif
 
 		*mp = sbcreatecontrol((caddr_t) &rtableid,
@@ -1825,45 +1793,21 @@ ip_send_dispatch(void *xmq)
 	struct mbuf_queue *mq = xmq;
 	struct mbuf *m;
 	struct mbuf_list ml;
-#ifdef IPSEC
-	int locked = 0;
-#endif /* IPSEC */
 
 	mq_delist(mq, &ml);
 	if (ml_empty(&ml))
 		return;
 
-	NET_LOCK();
-
-#ifdef IPSEC
-	/*
-	 * IPsec is not ready to run without KERNEL_LOCK().  So all
-	 * the traffic on your machine is punished if you have IPsec
-	 * enabled.
-	 */
-	extern int ipsec_in_use;
-	if (ipsec_in_use) {
-		NET_UNLOCK();
-		KERNEL_LOCK();
-		NET_LOCK();
-		locked = 1;
-	}
-#endif /* IPSEC */
-
+	NET_RLOCK();
 	while ((m = ml_dequeue(&ml)) != NULL) {
 		ip_output(m, NULL, NULL, 0, NULL, NULL, 0);
 	}
-	NET_UNLOCK();
-
-#ifdef IPSEC
-	if (locked)
-		KERNEL_UNLOCK();
-#endif /* IPSEC */
+	NET_RUNLOCK();
 }
 
 void
 ip_send(struct mbuf *m)
 {
 	mq_enqueue(&ipsend_mq, m);
-	task_add(softnettq, &ipsend_task);
+	task_add(net_tq(0), &ipsend_task);
 }

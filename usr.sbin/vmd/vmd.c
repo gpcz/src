@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmd.c,v 1.70 2017/10/07 02:05:31 mlarkin Exp $	*/
+/*	$OpenBSD: vmd.c,v 1.76 2017/12/06 13:29:02 abieber Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -102,7 +102,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 			cmd = IMSG_VMDOP_START_VM_RESPONSE;
 		}
 		if (res == 0 &&
-		    config_setvm(ps, vm, imsg->hdr.peerid, vmc.vmc_uid) == -1) {
+		    config_setvm(ps, vm, imsg->hdr.peerid, vm->vm_params.vmc_uid) == -1) {
 			res = errno;
 			cmd = IMSG_VMDOP_START_VM_RESPONSE;
 		}
@@ -394,11 +394,14 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_VMDOP_TERMINATE_VM_EVENT:
 		IMSG_SIZE_CHECK(imsg, &vmr);
 		memcpy(&vmr, imsg->data, sizeof(vmr));
-		log_debug("%s: handling TERMINATE_EVENT for vm id %d",
-		    __func__, vmr.vmr_id);
-		if ((vm = vm_getbyvmid(vmr.vmr_id)) == NULL)
+		log_debug("%s: handling TERMINATE_EVENT for vm id %d ret %d",
+		    __func__, vmr.vmr_id, vmr.vmr_result);
+		if ((vm = vm_getbyvmid(vmr.vmr_id)) == NULL) {
+			log_debug("%s: vm %d is no longer available",
+			    __func__, vmr.vmr_id);
 			break;
-		if (vmr.vmr_result == 0) {
+		}
+		if (vmr.vmr_result != EAGAIN) {
 			if (vm->vm_from_config) {
 				log_debug("%s: about to stop vm id %d",
 				    __func__, vm->vm_vmid);
@@ -408,7 +411,7 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 				    __func__, vm->vm_vmid);
 				vm_remove(vm);
 			}
-		} else if (vmr.vmr_result == EAGAIN) {
+		} else {
 			/* Stop VM instance but keep the tty open */
 			log_debug("%s: about to stop vm id %d with tty open",
 			    __func__, vm->vm_vmid);
@@ -837,7 +840,7 @@ vmd_configure(void)
 			    vm->vm_params.vmc_params.vcp_name);
 			continue;
 		}
-		if (config_setvm(&env->vmd_ps, vm, -1, 0) == -1)
+		if (config_setvm(&env->vmd_ps, vm, -1, vm->vm_params.vmc_uid) == -1)
 			return (-1);
 	}
 
@@ -915,7 +918,7 @@ vmd_reload(unsigned int reset, const char *filename)
 					    vm->vm_params.vmc_params.vcp_name);
 					continue;
 				}
-				if (config_setvm(&env->vmd_ps, vm, -1, 0) == -1)
+				if (config_setvm(&env->vmd_ps, vm, -1, vm->vm_params.vmc_uid) == -1)
 					return (-1);
 			} else {
 				log_debug("%s: not creating vm \"%s\": "
@@ -1098,7 +1101,7 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 
 	if ((vm = vm_getbyname(vcp->vcp_name)) != NULL ||
 	    (vm = vm_getbyvmid(vcp->vcp_id)) != NULL) {
-		if (vm_checkperm(vm, uid) != 0 || vmc->vmc_flags != 0) {
+		if (vm_checkperm(vm, uid) != 0) {
 			errno = EPERM;
 			goto fail;
 		}
@@ -1169,10 +1172,6 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 		vm->vm_ifs[i].vif_fd = -1;
 
 		if ((sw = switch_getbyname(vmc->vmc_ifswitch[i])) != NULL) {
-			/* overwrite the rdomain, if configured on the switch */
-			if (sw->sw_flags & VMIFF_RDOMAIN)
-				vmc->vmc_ifrdomain[i] = sw->sw_rdomain;
-
 			/* inherit per-interface flags from the switch */
 			vmc->vmc_ifflags[i] |= (sw->sw_flags & VMIFF_OPTMASK);
 		}
@@ -1214,6 +1213,21 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 	return (-1);
 }
 
+/*
+ * vm_checkperm
+ *
+ * Checks if the user represented by the 'uid' parameter is allowed to
+ * manipulate the VM described by the 'vm' parameter (or connect to said VM's
+ * console.)
+ *
+ * Parameters:
+ *  vm: the VM whose permission is to be checked
+ *  uid: the user ID of the user making the request
+ *
+ * Return values:
+ *   0: the permission should be granted
+ *  -1: the permission check failed (also returned if vm == null)
+ */
 int
 vm_checkperm(struct vmd_vm *vm, uid_t uid)
 {
@@ -1339,19 +1353,10 @@ vm_closetty(struct vmd_vm *vm)
 void
 switch_remove(struct vmd_switch *vsw)
 {
-	struct vmd_if	*vif;
-
 	if (vsw == NULL)
 		return;
 
 	TAILQ_REMOVE(env->vmd_switches, vsw, sw_entry);
-
-	while ((vif = TAILQ_FIRST(&vsw->sw_ifs)) != NULL) {
-		free(vif->vif_name);
-		free(vif->vif_switch);
-		TAILQ_REMOVE(&vsw->sw_ifs, vif, vif_entry);
-		free(vif);
-	}
 
 	free(vsw->sw_group);
 	free(vsw->sw_name);

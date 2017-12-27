@@ -1,4 +1,4 @@
-/*	$OpenBSD: emacs.c,v 1.73 2017/08/30 17:02:53 jca Exp $	*/
+/*	$OpenBSD: emacs.c,v 1.76 2017/12/18 19:04:53 anton Exp $	*/
 
 /*
  *  Emacs-like command line editing and history
@@ -186,7 +186,6 @@ static int	x_search_char_back(int);
 static int	x_search_hist(int);
 static int	x_set_mark(int);
 static int	x_transpose(int);
-static int	x_version(int);
 static int	x_xchg_point_mark(int);
 static int	x_yank(int);
 static int	x_comp_list(int);
@@ -243,7 +242,6 @@ static const struct x_ftab x_ftab[] = {
 	{ x_search_hist,	"search-history",		0 },
 	{ x_set_mark,		"set-mark-command",		0 },
 	{ x_transpose,		"transpose-chars",		0 },
-	{ x_version,		"version",			0 },
 	{ x_xchg_point_mark,	"exchange-point-and-mark",	0 },
 	{ x_yank,		"yank",				0 },
 	{ x_comp_list,		"complete-list",		0 },
@@ -1472,6 +1470,7 @@ x_init_emacs(void)
 	kb_add(x_del_back,		NULL, CTRL('?'), 0);
 	kb_add(x_del_back,		NULL, CTRL('H'), 0);
 	kb_add(x_del_char,		NULL, CTRL('['), '[', '3', '~', 0); /* delete */
+	kb_add(x_del_bword,		NULL, CTRL('W'), 0);
 	kb_add(x_del_bword,		NULL, CTRL('['), CTRL('?'), 0);
 	kb_add(x_del_bword,		NULL, CTRL('['), CTRL('H'), 0);
 	kb_add(x_del_bword,		NULL, CTRL('['), 'h', 0);
@@ -1493,7 +1492,6 @@ x_init_emacs(void)
 	kb_add(x_mv_fword,		NULL, CTRL('['), 'f', 0);
 	kb_add(x_goto_hist,		NULL, CTRL('['), 'g', 0);
 	/* kill-line */
-	kb_add(x_del_bword,		NULL, CTRL('W'), 0); /* not what man says */
 	kb_add(x_kill,			NULL, CTRL('K'), 0);
 	kb_add(x_enumerate,		NULL, CTRL('['), '?', 0);
 	kb_add(x_list_comm,		NULL, CTRL('X'), '?', 0);
@@ -1505,6 +1503,7 @@ x_init_emacs(void)
 	kb_add(x_prev_histword,		NULL, CTRL('['), '.', 0);
 	kb_add(x_prev_histword,		NULL, CTRL('['), '_', 0);
 	/* how to handle: quote: ^^ */
+	kb_add(x_literal,		NULL, CTRL('^'), 0);
 	kb_add(x_draw_line,		NULL, CTRL('L'), 0);
 	kb_add(x_search_char_back,	NULL, CTRL('['), CTRL(']'), 0);
 	kb_add(x_search_char_forw,	NULL, CTRL(']'), 0);
@@ -1516,7 +1515,6 @@ x_init_emacs(void)
 	kb_add(x_fold_upper,		NULL, CTRL('['), 'U', 0);
 	kb_add(x_fold_upper,		NULL, CTRL('['), 'u', 0);
 	kb_add(x_literal,		NULL, CTRL('V'), 0);
-	kb_add(x_literal,		NULL, CTRL('^'), 0);
 	kb_add(x_yank,			NULL, CTRL('Y'), 0);
 	kb_add(x_meta_yank,		NULL, CTRL('['), 'y', 0);
 	/* man page ends here */
@@ -1538,6 +1536,8 @@ x_init_emacs(void)
 	kb_add(x_mv_end,		NULL, CTRL('['), 'O', 'F', 0); /* end */
 	kb_add(x_mv_begin,		NULL, CTRL('['), '[', '1', '~', 0); /* home */
 	kb_add(x_mv_end,		NULL, CTRL('['), '[', '4', '~', 0); /* end */
+	kb_add(x_mv_begin,		NULL, CTRL('['), '[', '7', '~', 0); /* home */
+	kb_add(x_mv_end,		NULL, CTRL('['), '[', '8', '~', 0); /* end */
 
 	/* can't be bound */
 	kb_add(x_set_arg,		NULL, CTRL('['), '0', 0);
@@ -1619,35 +1619,6 @@ x_xchg_point_mark(int c)
 	tmp = xmp;
 	xmp = xcp;
 	x_goto( tmp );
-	return KSTD;
-}
-
-static int
-x_version(int c)
-{
-	char *o_xbuf = xbuf, *o_xend = xend;
-	char *o_xbp = xbp, *o_xep = xep, *o_xcp = xcp;
-	int lim = x_lastcp() - xbp;
-
-	xbuf = xbp = xcp = (char *) ksh_version + 4;
-	xend = xep = (char *) ksh_version + 4 + strlen(ksh_version + 4);
-	x_redraw(lim);
-	x_flush();
-
-	c = x_e_getc();
-	xbuf = o_xbuf;
-	xend = o_xend;
-	xbp = o_xbp;
-	xep = o_xep;
-	xcp = o_xcp;
-	x_redraw(strlen(ksh_version));
-
-	if (c < 0)
-		return KSTD;
-	/* This is what at&t ksh seems to do...  Very bizarre */
-	if (c != ' ')
-		x_e_ungetc(c);
-
 	return KSTD;
 }
 

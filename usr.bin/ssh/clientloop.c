@@ -1,4 +1,4 @@
-/* $OpenBSD: clientloop.c,v 1.305 2017/09/19 04:24:22 djm Exp $ */
+/* $OpenBSD: clientloop.c,v 1.309 2017/12/18 23:16:23 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -215,19 +215,6 @@ signal_handler(int sig)
 {
 	received_signal = sig;
 	quit_pending = 1;
-}
-
-/*
- * Returns current time in seconds from Jan 1, 1970 with the maximum
- * available resolution.
- */
-
-static double
-get_current_time(void)
-{
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-	return (double) tv.tv_sec + (double) tv.tv_usec / 1000000.0;
 }
 
 /*
@@ -1247,7 +1234,7 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 			fatal("%s pledge(): %s", __func__, strerror(errno));
 	}
 
-	start_time = get_current_time();
+	start_time = monotime_double();
 
 	/* Initialize variables. */
 	last_was_cr = 1;
@@ -1436,7 +1423,7 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	buffer_free(&stderr_buffer);
 
 	/* Report bytes transferred, and transfer rates. */
-	total_time = get_current_time() - start_time;
+	total_time = monotime_double() - start_time;
 	packet_get_bytes(&ibytes, &obytes);
 	verbose("Transferred: sent %llu, received %llu bytes, in %.1f seconds",
 	    (unsigned long long)obytes, (unsigned long long)ibytes, total_time);
@@ -1592,12 +1579,13 @@ client_request_agent(struct ssh *ssh, const char *request_type, int rchan)
 	return c;
 }
 
-int
+char *
 client_request_tun_fwd(struct ssh *ssh, int tun_mode,
     int local_tun, int remote_tun)
 {
 	Channel *c;
 	int fd;
+	char *ifname = NULL;
 
 	if (tun_mode == SSH_TUNMODE_NO)
 		return 0;
@@ -1605,10 +1593,11 @@ client_request_tun_fwd(struct ssh *ssh, int tun_mode,
 	debug("Requesting tun unit %d in mode %d", local_tun, tun_mode);
 
 	/* Open local tunnel device */
-	if ((fd = tun_open(local_tun, tun_mode)) == -1) {
+	if ((fd = tun_open(local_tun, tun_mode, &ifname)) == -1) {
 		error("Tunnel device open failed.");
-		return -1;
+		return NULL;
 	}
+	debug("Tunnel forwarding using interface %s", ifname);
 
 	c = channel_new(ssh, "tun", SSH_CHANNEL_OPENING, fd, fd, -1,
 	    CHAN_TCP_WINDOW_DEFAULT, CHAN_TCP_PACKET_DEFAULT, 0, "tun", 1);
@@ -1623,7 +1612,7 @@ client_request_tun_fwd(struct ssh *ssh, int tun_mode,
 	packet_put_int(remote_tun);
 	packet_send();
 
-	return 0;
+	return ifname;
 }
 
 /* XXXX move to generic input handler */
@@ -1889,7 +1878,7 @@ client_global_hostkeys_private_confirm(struct ssh *ssh, int type,
 	struct hostkeys_update_ctx *ctx = (struct hostkeys_update_ctx *)_ctx;
 	size_t i, ndone;
 	struct sshbuf *signdata;
-	int r;
+	int r, kexsigtype, use_kexsigtype;
 	const u_char *sig;
 	size_t siglen;
 
@@ -1901,6 +1890,9 @@ client_global_hostkeys_private_confirm(struct ssh *ssh, int type,
 		hostkeys_update_ctx_free(ctx);
 		return;
 	}
+	kexsigtype = sshkey_type_plain(
+	    sshkey_type_from_name(ssh->kex->hostkey_alg));
+
 	if ((signdata = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new failed", __func__);
 	/* Don't want to accidentally accept an unbound signature */
@@ -1929,8 +1921,15 @@ client_global_hostkeys_private_confirm(struct ssh *ssh, int type,
 			    __func__, ssh_err(r));
 			goto out;
 		}
+		/*
+		 * For RSA keys, prefer to use the signature type negotiated
+		 * during KEX to the default (SHA1).
+		 */
+		use_kexsigtype = kexsigtype == KEY_RSA &&
+		    sshkey_type_plain(ctx->keys[i]->type) == KEY_RSA;
 		if ((r = sshkey_verify(ctx->keys[i], sig, siglen,
-		    sshbuf_ptr(signdata), sshbuf_len(signdata), 0)) != 0) {
+		    sshbuf_ptr(signdata), sshbuf_len(signdata),
+		    use_kexsigtype ? ssh->kex->hostkey_alg : NULL, 0)) != 0) {
 			error("%s: server gave bad signature for %s key %zu",
 			    __func__, sshkey_type(ctx->keys[i]), i);
 			goto out;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: pf.c,v 1.1042 2017/08/14 15:58:16 henning Exp $ */
+/*	$OpenBSD: pf.c,v 1.1051 2017/12/24 14:18:19 bluhm Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -161,8 +161,6 @@ struct pool		 pf_src_tree_pl, pf_rule_pl, pf_queue_pl;
 struct pool		 pf_state_pl, pf_state_key_pl, pf_state_item_pl;
 struct pool		 pf_rule_item_pl, pf_sn_item_pl;
 
-void			 pf_init_threshold(struct pf_threshold *, u_int32_t,
-			    u_int32_t);
 void			 pf_add_threshold(struct pf_threshold *);
 int			 pf_check_threshold(struct pf_threshold *);
 int			 pf_check_tcp_cksum(struct mbuf *, int, int,
@@ -251,6 +249,8 @@ void			 pf_state_key_link(struct pf_state_key *,
 			    struct pf_state_key *);
 void			 pf_inpcb_unlink_state_key(struct inpcb *);
 void			 pf_state_key_unlink_reverse(struct pf_state_key *);
+void			 pf_state_key_link_inpcb(struct pf_state_key *,
+			    struct inpcb *);
 
 #if NPFLOG > 0
 void			 pf_log_matches(struct pf_pdesc *, struct pf_rule *,
@@ -274,6 +274,13 @@ struct pf_pool_limit pf_pool_limits[PF_LIMIT_MAX] = {
 		s = pf_find_state(i, k, d, m);				\
 		if (s == NULL || (s)->timeout == PFTM_PURGE)		\
 			return (PF_DROP);				\
+		if ((s)->rule.ptr->pktrate.limit && d == (s)->direction) { \
+			pf_add_threshold(&(s)->rule.ptr->pktrate);	\
+			if (pf_check_threshold(&(s)->rule.ptr->pktrate)) { \
+				s = NULL;				\
+				return (PF_DROP);			\
+			}						\
+		}							\
 		if (d == PF_OUT &&					\
 		    (((s)->rule.ptr->rt == PF_ROUTETO &&		\
 		    (s)->rule.ptr->direction == PF_OUT) ||		\
@@ -1080,8 +1087,9 @@ pf_find_state(struct pfi_kif *kif, struct pf_state_key_cmp *key, u_int dir,
 		if (dir == PF_OUT && pkt_sk &&
 		    pf_compare_state_keys(pkt_sk, sk, kif, dir) == 0)
 			pf_state_key_link(sk, pkt_sk);
-		else if (dir == PF_OUT)
-			pf_inp_link(m, m->m_pkthdr.pf.inp);
+		else if (dir == PF_OUT && m->m_pkthdr.pf.inp &&
+		    !m->m_pkthdr.pf.inp->inp_pf_sk && !sk->inp)
+			pf_state_key_link_inpcb(sk, m->m_pkthdr.pf.inp);
 	}
 
 	/* remove firewall data from outbound packet */
@@ -1222,7 +1230,7 @@ pf_purge_expired_rules(void)
 void
 pf_purge_timeout(void *unused)
 {
-	task_add(softnettq, &pf_purge_task);
+	task_add(net_tq(0), &pf_purge_task);
 }
 
 void
@@ -1375,7 +1383,8 @@ pf_remove_divert_state(struct pf_state_key *sk)
 
 	TAILQ_FOREACH(si, &sk->states, entry) {
 		if (sk == si->s->key[PF_SK_STACK] && si->s->rule.ptr &&
-		    si->s->rule.ptr->divert.port) {
+		    (si->s->rule.ptr->divert.type == PF_DIVERT_TO ||
+		    si->s->rule.ptr->divert.type == PF_DIVERT_REPLY)) {
 			pf_remove_state(si->s);
 			break;
 		}
@@ -3184,12 +3193,14 @@ pf_socket_lookup(struct pf_pdesc *pd)
 		sport = pd->hdr.tcp.th_sport;
 		dport = pd->hdr.tcp.th_dport;
 		PF_ASSERT_LOCKED();
+		NET_ASSERT_LOCKED();
 		tb = &tcbtable;
 		break;
 	case IPPROTO_UDP:
 		sport = pd->hdr.udp.uh_sport;
 		dport = pd->hdr.udp.uh_dport;
 		PF_ASSERT_LOCKED();
+		NET_ASSERT_LOCKED();
 		tb = &udbtable;
 		break;
 	default:
@@ -3216,7 +3227,7 @@ pf_socket_lookup(struct pf_pdesc *pd)
 		inp = in_pcbhashlookup(tb, saddr->v4, sport, daddr->v4, dport,
 		    pd->rdomain);
 		if (inp == NULL) {
-			inp = in_pcblookup_listen(tb, daddr->v4, dport, 0,
+			inp = in_pcblookup_listen(tb, daddr->v4, dport,
 			    NULL, pd->rdomain);
 			if (inp == NULL)
 				return (-1);
@@ -3227,7 +3238,7 @@ pf_socket_lookup(struct pf_pdesc *pd)
 		inp = in6_pcbhashlookup(tb, &saddr->v6, sport, &daddr->v6,
 		    dport, pd->rdomain);
 		if (inp == NULL) {
-			inp = in6_pcblookup_listen(tb, &daddr->v6, dport, 0,
+			inp = in6_pcblookup_listen(tb, &daddr->v6, dport,
 			    NULL, pd->rdomain);
 			if (inp == NULL)
 				return (-1);
@@ -3595,6 +3606,13 @@ pf_match_rule(struct pf_test_ctx *ctx, struct pf_ruleset *ruleset)
 		    (r->prio == PF_PRIO_ZERO ? 0 : r->prio) !=
 		    ctx->pd->m->m_pkthdr.pf.prio),
 			TAILQ_NEXT(r, entries));
+
+		/* must be last! */
+		if (r->pktrate.limit) {
+			pf_add_threshold(&r->pktrate);
+			PF_TEST_ATTRIB((pf_check_threshold(&r->pktrate)),
+				TAILQ_NEXT(r, entries));
+		}
 
 		/* FALLTHROUGH */
 		if (r->tag)
@@ -6587,6 +6605,14 @@ pf_setup_pdesc(struct pf_pdesc *pd, sa_family_t af, int dir,
 		case ND_NEIGHBOR_SOLICIT:
 		case ND_NEIGHBOR_ADVERT:
 			icmp_hlen = sizeof(struct nd_neighbor_solicit);
+			/* FALLTHROUGH */
+		case ND_ROUTER_SOLICIT:
+		case ND_ROUTER_ADVERT:
+		case ND_REDIRECT:
+			if (pd->ttl != 255) {
+				REASON_SET(reason, PFRES_NORM);
+				return (PF_DROP);
+			}
 			break;
 		}
 		if (icmp_hlen > sizeof(struct icmp6_hdr) &&
@@ -6761,6 +6787,17 @@ pf_test(sa_family_t af, int fwdir, struct ifnet *ifp, struct mbuf **m0)
 		}
 	}
 	pd.m->m_pkthdr.pf.flags |= PF_TAG_PROCESSED;
+
+	/*
+	 * Avoid pcb-lookups from the forwarding path.  They should never
+	 * match and would cause MP locking problems.
+	 */
+	if (fwdir == PF_FWD) {
+		pd.lookup.done = -1;
+		pd.lookup.uid = UID_MAX;
+		pd.lookup.gid = GID_MAX;
+		pd.lookup.pid = NO_PID;
+	}
 
 	/* lock the lookup/write section of pf_test() */
 	PF_LOCK();
@@ -6945,7 +6982,7 @@ done:
 	/*
 	 * connections redirected to loopback should not match sockets
 	 * bound specifically to loopback due to security implications,
-	 * see tcp_input() and in_pcblookup_listen().
+	 * see in_pcblookup_listen().
 	 */
 	if (pd.destchg)
 		if ((pd.af == AF_INET && (ntohl(pd.dst->v4.s_addr) >>
@@ -6956,18 +6993,21 @@ done:
 	if (pd.destchg && pd.dir == PF_OUT)
 		pd.m->m_pkthdr.pf.flags |= PF_TAG_REROUTE;
 
-	if (pd.dir == PF_IN && action == PF_PASS && r->divert.port) {
+	if (pd.dir == PF_IN && action == PF_PASS &&
+	    (r->divert.type == PF_DIVERT_TO ||
+	    r->divert.type == PF_DIVERT_REPLY)) {
 		struct pf_divert *divert;
 
 		if ((divert = pf_get_divert(pd.m))) {
 			pd.m->m_pkthdr.pf.flags |= PF_TAG_DIVERTED;
+			divert->addr = r->divert.addr;
 			divert->port = r->divert.port;
 			divert->rdomain = pd.rdomain;
-			divert->addr = r->divert.addr;
+			divert->type = r->divert.type;
 		}
 	}
 
-	if (action == PF_PASS && r->divert_packet.port)
+	if (action == PF_PASS && r->divert.type == PF_DIVERT_PACKET)
 		action = PF_DIVERT;
 
 #if NPFLOG > 0
@@ -6998,13 +7038,12 @@ done:
 	case PF_DIVERT:
 		switch (pd.af) {
 		case AF_INET:
-			if (!divert_packet(pd.m, pd.dir, r->divert_packet.port))
+			if (!divert_packet(pd.m, pd.dir, r->divert.port))
 				pd.m = NULL;
 			break;
 #ifdef INET6
 		case AF_INET6:
-			if (!divert6_packet(pd.m, pd.dir,
-			    r->divert_packet.port))
+			if (!divert6_packet(pd.m, pd.dir, r->divert.port))
 				pd.m = NULL;
 			break;
 #endif /* INET6 */
@@ -7058,7 +7097,8 @@ done:
 
 #ifdef INET6
 	/* if reassembled packet passed, create new fragments */
-	if (pf_status.reass && action == PF_PASS && pd.m && fwdir == PF_FWD) {
+	if (pf_status.reass && action == PF_PASS && pd.m && fwdir == PF_FWD &&
+	    pd.af == AF_INET6) {
 		struct m_tag	*mtag;
 
 		if ((mtag = m_tag_find(pd.m, PACKET_TAG_PF_REASSEMBLED, NULL)))
@@ -7089,10 +7129,6 @@ pf_ouraddr(struct mbuf *m)
 	if (sk != NULL) {
 		if (sk->inp != NULL)
 			return (1);
-
-		/* If we have linked state keys it is certainly forwarded. */
-		if (sk->reverse != NULL)
-			return (0);
 	}
 
 	return (-1);
@@ -7226,6 +7262,15 @@ void
 pf_pkt_state_key_ref(struct mbuf *m)
 {
 	pf_state_key_ref(m->m_pkthdr.pf.statekey);
+}
+
+void
+pf_state_key_link_inpcb(struct pf_state_key *sk, struct inpcb *inp)
+{
+	KASSERT(sk->inp == NULL);
+	sk->inp = inp;
+	KASSERT(inp->inp_pf_sk == NULL);
+	inp->inp_pf_sk = pf_state_key_ref(sk);
 }
 
 void

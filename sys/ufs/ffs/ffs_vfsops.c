@@ -1,4 +1,4 @@
-/*	$OpenBSD: ffs_vfsops.c,v 1.166 2017/05/29 14:07:16 sf Exp $	*/
+/*	$OpenBSD: ffs_vfsops.c,v 1.170 2017/12/14 20:20:38 deraadt Exp $	*/
 /*	$NetBSD: ffs_vfsops.c,v 1.19 1996/02/09 22:22:26 christos Exp $	*/
 
 /*
@@ -206,17 +206,13 @@ ffs_mount(struct mount *mp, const char *path, void *data,
     struct nameidata *ndp, struct proc *p)
 {
 	struct vnode *devvp;
-	struct ufs_args args;
+	struct ufs_args *args = data;
 	struct ufsmount *ump = NULL;
 	struct fs *fs;
 	char fname[MNAMELEN];
 	char fspec[MNAMELEN];
 	int error = 0, flags;
 	int ronly;
-
-	error = copyin(data, &args, sizeof(struct ufs_args));
-	if (error)
-		return (error);
 
 #ifndef FFS_SOFTUPDATES
 	if (mp->mnt_flag & MNT_SOFTDEP) {
@@ -247,14 +243,14 @@ ffs_mount(struct mount *mp, const char *path, void *data,
 
 		if (ronly == 0 && (mp->mnt_flag & MNT_RDONLY)) {
 			/* Flush any dirty data */
-			mp->mnt_flag &= ~MNT_RDONLY;
 			VFS_SYNC(mp, MNT_WAIT, p->p_ucred, p);
-			mp->mnt_flag |= MNT_RDONLY;
 
 			/*
 			 * Get rid of files open for writing.
 			 */
 			flags = WRITECLOSE;
+			if (args == NULL)
+				flags |= IGNORECLEAN;
 			if (mp->mnt_flag & MNT_FORCE)
 				flags |= FORCECLOSE;
 			if (fs->fs_flags & FS_DOSOFTDEP) {
@@ -262,6 +258,7 @@ ffs_mount(struct mount *mp, const char *path, void *data,
 				mp->mnt_flag &= ~MNT_SOFTDEP;
 			} else
 				error = ffs_flushfiles(mp, flags, p);
+			mp->mnt_flag |= MNT_RDONLY;
 			ronly = 1;
 		}
 
@@ -342,12 +339,14 @@ ffs_mount(struct mount *mp, const char *path, void *data,
 
 			ronly = 0;
 		}
-		if (args.fspec == NULL) {
+		if (args == NULL)
+			goto success;
+		if (args->fspec == NULL) {
 			/*
 			 * Process export requests.
 			 */
 			error = vfs_export(mp, &ump->um_export, 
-			    &args.export_info);
+			    &args->export_info);
 			if (error)
 				goto error_1;
 			else
@@ -359,7 +358,7 @@ ffs_mount(struct mount *mp, const char *path, void *data,
 	 * Not an update, or updating the name: look up the name
 	 * and verify that it refers to a sensible block device.
 	 */
-	error = copyinstr(args.fspec, fspec, sizeof(fspec), NULL);
+	error = copyinstr(args->fspec, fspec, sizeof(fspec), NULL);
 	if (error)
 		goto error_1;
 
@@ -435,7 +434,8 @@ ffs_mount(struct mount *mp, const char *path, void *data,
 	 *
 	 * This code is common to root and non-root mounts
 	 */
-	memcpy(&mp->mnt_stat.mount_info.ufs_args, &args, sizeof(args));
+	if (args)
+		memcpy(&mp->mnt_stat.mount_info.ufs_args, args, sizeof(*args));
 	VFS_STATFS(mp, &mp->mnt_stat, p);
 
 success:
@@ -456,6 +456,7 @@ success:
 				fs->fs_flags &= ~FS_DOSOFTDEP;
 		}
 		ffs_sbupdate(ump, MNT_WAIT);
+#if 0
 		if (ronly) {
 			int force = 0;
 
@@ -466,6 +467,7 @@ success:
 			VOP_IOCTL(ump->um_devvp, DIOCCACHESYNC, &force,
 			    FWRITE, FSCRED, p);
                }
+#endif
 	}
 	return (0);
 
@@ -1148,11 +1150,23 @@ ffs_sync_vnode(struct vnode *vp, void *arg) {
 	struct inode *ip;
 	int error;
 
+	if (vp->v_type == VNON)
+		return (0);
+
 	ip = VTOI(vp);
-	if (vp->v_type == VNON || 
-	    ((ip->i_flag &
+
+	/*
+	 * If unmounting or converting rw to ro, then stop deferring
+	 * timestamp writes.
+	 */
+	if (fsa->waitfor == MNT_WAIT && (ip->i_flag & IN_LAZYMOD)) {
+		ip->i_flag |= IN_MODIFIED;
+		UFS_UPDATE(ip, 1);
+	}
+
+	if ((ip->i_flag &
 		(IN_ACCESS | IN_CHANGE | IN_MODIFIED | IN_UPDATE)) == 0	&&
-		LIST_EMPTY(&vp->v_dirtyblkhd)) ) {
+		LIST_EMPTY(&vp->v_dirtyblkhd)) {
 		return (0);
 	}
 

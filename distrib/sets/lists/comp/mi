@@ -118,6 +118,7 @@
 ./usr/include/dev/fdt/if_mvnetareg.h
 ./usr/include/dev/fdt/mvmdiovar.h
 ./usr/include/dev/fdt/rkclock_clocks.h
+./usr/include/dev/fdt/rsbvar.h
 ./usr/include/dev/fdt/sunxireg.h
 ./usr/include/dev/fdt/sxiccmu_clocks.h
 ./usr/include/dev/fdt/sxipio_pins.h
@@ -237,6 +238,8 @@
 ./usr/include/dev/ic/ds1687reg.h
 ./usr/include/dev/ic/dwc_gmac_reg.h
 ./usr/include/dev/ic/dwc_gmac_var.h
+./usr/include/dev/ic/dwiicreg.h
+./usr/include/dev/ic/dwiicvar.h
 ./usr/include/dev/ic/elink3reg.h
 ./usr/include/dev/ic/elink3var.h
 ./usr/include/dev/ic/espreg.h
@@ -547,6 +550,7 @@
 ./usr/include/dev/pci/if_ix.h
 ./usr/include/dev/pci/if_ixgb.h
 ./usr/include/dev/pci/if_ixgb_osdep.h
+./usr/include/dev/pci/if_ixlreg.h
 ./usr/include/dev/pci/if_jmereg.h
 ./usr/include/dev/pci/if_jmevar.h
 ./usr/include/dev/pci/if_lgereg.h
@@ -711,6 +715,7 @@
 ./usr/include/dev/tc/tcdsvar.h
 ./usr/include/dev/tc/tcreg.h
 ./usr/include/dev/tc/tcvar.h
+./usr/include/dev/tc/zs_ioasicvar.h
 ./usr/include/dev/usb
 ./usr/include/dev/usb/dwc2
 ./usr/include/dev/usb/dwc2/dwc2.h
@@ -944,7 +949,6 @@
 ./usr/include/net/route.h
 ./usr/include/net/rtable.h
 ./usr/include/net/slcompress.h
-./usr/include/net/slip.h
 ./usr/include/net/trunklacp.h
 ./usr/include/net80211
 ./usr/include/net80211/ieee80211.h
@@ -2732,6 +2736,7 @@
 ./usr/share/man/man9/bufq_init.9
 ./usr/share/man/man9/bus_dma.9
 ./usr/share/man/man9/bus_space.9
+./usr/share/man/man9/cond_init.9
 ./usr/share/man/man9/config_attach.9
 ./usr/share/man/man9/config_defer.9
 ./usr/share/man/man9/copy.9

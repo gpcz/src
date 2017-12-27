@@ -1,4 +1,4 @@
-/*	$OpenBSD: systm.h,v 1.133 2017/08/11 21:24:20 mpi Exp $	*/
+/*	$OpenBSD: systm.h,v 1.136 2017/12/14 00:41:58 dlg Exp $	*/
 /*	$NetBSD: systm.h,v 1.50 1996/06/09 04:55:09 briggs Exp $	*/
 
 /*-
@@ -247,6 +247,11 @@ int	sleep_finish_timeout(struct sleep_state *);
 int	sleep_finish_signal(struct sleep_state *);
 void	sleep_queue_init(void);
 
+struct cond;
+void	cond_init(struct cond *);
+void	cond_wait(struct cond *, const char *);
+void	cond_signal(struct cond *);
+
 struct mutex;
 struct rwlock;
 void    wakeup_n(const volatile void *, int);
@@ -296,26 +301,36 @@ int	uiomove(void *, size_t, struct uio *);
 
 extern struct rwlock netlock;
 
-#define	NET_LOCK()							\
+#define	NET_LOCK()		NET_WLOCK()
+#define	NET_UNLOCK()		NET_WUNLOCK()
+#define	NET_ASSERT_UNLOCKED()	NET_ASSERT_WUNLOCKED()
+
+
+#define	NET_WLOCK()	do { rw_enter_write(&netlock); } while (0)
+#define	NET_WUNLOCK()	do { rw_exit_write(&netlock); } while (0)
+
+#define	NET_ASSERT_WLOCKED()						\
 do {									\
-	rw_enter_write(&netlock);					\
+	int _s = rw_status(&netlock);					\
+	if ((splassert_ctl > 0) && (_s != RW_WRITE))			\
+		splassert_fail(RW_WRITE, _s, __func__);			\
 } while (0)
 
-#define	NET_UNLOCK()							\
+#define	NET_ASSERT_WUNLOCKED()						\
 do {									\
-	rw_exit_write(&netlock);					\
+	int _s = rw_status(&netlock);					\
+	if ((splassert_ctl > 0) && (_s == RW_WRITE))			\
+		splassert_fail(0, RW_WRITE, __func__);			\
 } while (0)
+
+#define	NET_RLOCK()	do { rw_enter_read(&netlock); } while (0)
+#define	NET_RUNLOCK()	do { rw_exit_read(&netlock); } while (0)
 
 #define	NET_ASSERT_LOCKED()						\
 do {									\
-	if (rw_status(&netlock) != RW_WRITE)				\
-		splassert_fail(RW_WRITE, rw_status(&netlock), __func__);\
-} while (0)
-
-#define	NET_ASSERT_UNLOCKED()						\
-do {									\
-	if (rw_status(&netlock) == RW_WRITE)				\
-		splassert_fail(0, rw_status(&netlock), __func__);	\
+	int _s = rw_status(&netlock);					\
+	if ((splassert_ctl > 0) && (_s != RW_WRITE && _s != RW_READ))	\
+		splassert_fail(RW_READ, _s, __func__);			\
 } while (0)
 
 __returns_twice int	setjmp(label_t *);

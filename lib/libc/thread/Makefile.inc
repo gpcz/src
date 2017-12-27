@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.inc,v 1.11 2017/09/05 02:40:54 guenther Exp $
+#	$OpenBSD: Makefile.inc,v 1.13 2017/11/04 22:53:57 jca Exp $
 
 .PATH: ${LIBCSRCDIR}/thread
 

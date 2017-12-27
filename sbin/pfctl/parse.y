@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.663 2017/08/11 22:30:38 benno Exp $	*/
+/*	$OpenBSD: parse.y,v 1.668 2017/11/28 16:05:46 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2001 Markus Friedl.  All rights reserved.
@@ -211,6 +211,7 @@ struct pool_opts {
 struct divertspec {
 	struct node_host	*addr;
 	u_int16_t		 port;
+	enum pf_divert_types	 type;
 };
 
 struct redirspec {
@@ -262,7 +263,6 @@ struct filter_opts {
 	u_int8_t		 prio;
 	u_int8_t		 set_prio[2];
 	struct divertspec	 divert;
-	struct divertspec	 divert_packet;
 	struct redirspec	 nat;
 	struct redirspec	 rdr;
 	struct redirspec	 rroute;
@@ -282,6 +282,11 @@ struct filter_opts {
 		sa_family_t		 af;
 		struct pf_poolhashkey	*key;
 	}			 route;
+
+	struct {
+		u_int32_t	limit;
+		u_int32_t	seconds;
+	}			 pktrate;
 } filter_opts;
 
 struct antispoof_opts {
@@ -472,7 +477,7 @@ int	parseport(char *, struct range *r, int);
 %token	QUEUE PRIORITY QLIMIT RTABLE RDOMAIN MINIMUM BURST PARENT
 %token	LOAD RULESET_OPTIMIZATION RTABLE RDOMAIN PRIO ONCE DEFAULT
 %token	STICKYADDRESS MAXSRCSTATES MAXSRCNODES SOURCETRACK GLOBAL RULE
-%token	MAXSRCCONN MAXSRCCONNRATE OVERLOAD FLUSH SLOPPY PFLOW
+%token	MAXSRCCONN MAXSRCCONNRATE OVERLOAD FLUSH SLOPPY PFLOW MAXPKTRATE
 %token	TAGGED TAG IFBOUND FLOATING STATEPOLICY STATEDEFAULTS ROUTE
 %token	DIVERTTO DIVERTREPLY DIVERTPACKET NATTO AFTO RDRTO RECEIVEDON NE LE GE
 %token	<v.string>		STRING
@@ -835,6 +840,8 @@ anchorrule	: ANCHOR anchorname dir quick interface af proto fromto
 			r.af = $6;
 			r.prob = $9.prob;
 			r.rtableid = $9.rtableid;
+			r.pktrate.limit = $9.pktrate.limit;
+			r.pktrate.seconds = $9.pktrate.seconds;
 
 			if ($9.tag)
 				if (strlcpy(r.tagname, $9.tag,
@@ -932,7 +939,7 @@ anchorrule	: ANCHOR anchorname dir quick interface af proto fromto
 loadrule	: LOAD ANCHOR string FROM string	{
 			struct loadanchors	*loadanchor;
 
-			if (strlen(pf->anchor->name) + 1 +
+			if (strlen(pf->anchor->path) + 1 +
 			    strlen($3) >= PATH_MAX) {
 				yyerror("anchorname %s too long, max %u\n",
 				    $3, PATH_MAX - 1);
@@ -947,7 +954,7 @@ loadrule	: LOAD ANCHOR string FROM string	{
 				err(1, "loadrule: malloc");
 			if (pf->anchor->name[0])
 				snprintf(loadanchor->anchorname, PATH_MAX,
-				    "%s/%s", pf->anchor->name, $3);
+				    "%s/%s", pf->anchor->path, $3);
 			else
 				strlcpy(loadanchor->anchorname, $3, PATH_MAX);
 			if ((loadanchor->filename = strdup($5)) == NULL)
@@ -1618,6 +1625,8 @@ pfrule		: action dir logquick interface af proto fromto
 			}
 
 			r.tos = $8.tos;
+			r.pktrate.limit = $8.pktrate.limit;
+			r.pktrate.seconds = $8.pktrate.seconds;
 			r.keep_state = $8.keep.action;
 			o = $8.keep.options;
 
@@ -1904,7 +1913,6 @@ pfrule		: action dir logquick interface af proto fromto
 			}
 			if (expand_divertspec(&r, &$8.divert))
 				YYERROR;
-			r.divert_packet.port = $8.divert_packet.port;
 
 			expand_rule(&r, 0, $4, &$8.nat, &$8.rdr, &$8.rroute, $6,
 			    $7.src_os,
@@ -2035,6 +2043,11 @@ filter_opt	: USER uids {
 			filter_opts.rtableid = $2;
 		}
 		| DIVERTTO STRING PORT portplain {
+			if (filter_opts.divert.type != PF_DIVERT_NONE) {
+				yyerror("more than one divert option");
+				YYERROR;
+			}
+			filter_opts.divert.type = PF_DIVERT_TO;
 			if ((filter_opts.divert.addr = host($2, pf->opts)) == NULL) {
 				yyerror("could not parse divert address: %s",
 				    $2);
@@ -2049,9 +2062,18 @@ filter_opt	: USER uids {
 			}
 		}
 		| DIVERTREPLY {
-			filter_opts.divert.port = 1;	/* some random value */
+			if (filter_opts.divert.type != PF_DIVERT_NONE) {
+				yyerror("more than one divert option");
+				YYERROR;
+			}
+			filter_opts.divert.type = PF_DIVERT_REPLY;
 		}
 		| DIVERTPACKET PORT number {
+			if (filter_opts.divert.type != PF_DIVERT_NONE) {
+				yyerror("more than one divert option");
+				YYERROR;
+			}
+			filter_opts.divert.type = PF_DIVERT_PACKET;
 			/*
 			 * If IP reassembly was not turned off, also
 			 * forcibly enable TCP reassembly by default.
@@ -2063,8 +2085,7 @@ filter_opt	: USER uids {
 				yyerror("invalid divert port");
 				YYERROR;
 			}
-
-			filter_opts.divert_packet.port = htons($3);
+			filter_opts.divert.port = htons($3);
 		}
 		| SCRUB '(' scrub_opts ')' {
 			filter_opts.nodf = $3.nodf;
@@ -2183,6 +2204,19 @@ filter_opt	: USER uids {
 		}
 		| ONCE {
 			filter_opts.marker |= FOM_ONCE;
+		}
+		| MAXPKTRATE NUMBER '/' NUMBER {
+			if ($2 < 0 || $2 > UINT_MAX ||
+			    $4 < 0 || $4 > UINT_MAX) {
+				yyerror("only positive values permitted");
+				YYERROR;
+			}
+			if (filter_opts.pktrate.limit) {
+				yyerror("cannot respecify max-pkt-rate");
+				YYERROR;
+			}
+			filter_opts.pktrate.limit = $2;
+			filter_opts.pktrate.seconds = $4;
 		}
 		| filter_sets
 		;
@@ -4050,11 +4084,7 @@ rule_consistent(struct pf_rule *r, int anchor_call)
 	/* Basic rule sanity check. */
 	switch (r->action) {
 	case PF_MATCH:
-		if (r->divert.port) {
-			yyerror("divert is not supported on match rules");
-			problems++;
-		}
-		if (r->divert_packet.port) {
+		if (r->divert.type != PF_DIVERT_NONE) {
 			yyerror("divert is not supported on match rules");
 			problems++;
 		}
@@ -4111,7 +4141,7 @@ process_tabledef(char *name, struct table_opts *opts, int popts)
 		    &opts->init_nodes);
 	if (!(pf->opts & PF_OPT_NOACTION) &&
 	    pfctl_define_table(name, opts->flags, opts->init_addr,
-	    pf->anchor->name, &ab, pf->anchor->ruleset.tticket)) {
+	    pf->anchor->path, &ab, pf->anchor->ruleset.tticket)) {
 		yyerror("cannot define table %s: %s", name,
 		    pfr_strerror(errno));
 		goto _error;
@@ -4393,38 +4423,43 @@ expand_divertspec(struct pf_rule *r, struct divertspec *ds)
 {
 	struct node_host *n;
 
-	if (ds->port == 0)
+	switch (ds->type) {
+	case PF_DIVERT_NONE:
 		return (0);
-
-	r->divert.port = ds->port;
-
-	if (r->direction == PF_OUT) {
-		if (ds->addr) {
-			yyerror("address specified for outgoing divert");
+	case PF_DIVERT_TO:
+		if (r->direction == PF_OUT) {
+			yyerror("divert-to used with outgoing rule");
 			return (1);
 		}
-		bzero(&r->divert.addr, sizeof(r->divert.addr));
+		if (r->af) {
+			for (n = ds->addr; n != NULL; n = n->next)
+				if (n->af == r->af)
+					break;
+			if (n == NULL) {
+				yyerror("divert-to address family mismatch");
+				return (1);
+			}
+			r->divert.addr = n->addr.v.a.addr;
+		} else {
+			r->af = ds->addr->af;
+			r->divert.addr = ds->addr->addr.v.a.addr;
+		}
+		r->divert.port = ds->port;
+		r->divert.type = ds->type;
 		return (0);
-	}
-
-	if (!ds->addr) {
-		yyerror("no address specified for incoming divert");
-		return (1);
-	}
-	if (r->af) {
-		for (n = ds->addr; n != NULL; n = n->next)
-			if (n->af == r->af)
-				break;
-		if (n == NULL) {
-			yyerror("address family mismatch for divert");
+	case PF_DIVERT_REPLY:
+		if (r->direction == PF_IN) {
+			yyerror("divert-reply used with incoming rule");
 			return (1);
 		}
-		r->divert.addr = n->addr.v.a.addr;
-	} else {
-		r->af = ds->addr->af;
-		r->divert.addr = ds->addr->addr.v.a.addr;
+		r->divert.type = ds->type;
+		return (0);
+	case PF_DIVERT_PACKET:
+		r->divert.port = ds->port;
+		r->divert.type = ds->type;
+		return (0);
 	}
-	return (0);
+	return (1);
 }
 
 int
@@ -5055,6 +5090,7 @@ lookup(char *s)
 		{ "matches",		MATCHES},
 		{ "max",		MAXIMUM},
 		{ "max-mss",		MAXMSS},
+		{ "max-pkt-rate",	MAXPKTRATE},
 		{ "max-src-conn",	MAXSRCCONN},
 		{ "max-src-conn-rate",	MAXSRCCONNRATE},
 		{ "max-src-nodes",	MAXSRCNODES},

@@ -1,4 +1,4 @@
-#	$OpenBSD: GENERIC,v 1.446 2017/10/11 17:19:50 patrick Exp $
+#	$OpenBSD: GENERIC,v 1.450 2017/12/24 19:50:56 patrick Exp $
 #
 # For further information on compiling OpenBSD kernels, see the config(8)
 # man page.
@@ -135,6 +135,7 @@ iic*	at nviic?
 amdpm*	at pci?			# AMD-7xx/8111 and NForce SMBus controller
 iic*	at amdpm?
 dwiic*	at acpi?		# DesignWare Synopsys i2c controller
+dwiic*	at pci?
 iic*	at dwiic?
 
 itherm*	at pci?			# Intel 3400 Thermal Sensor
@@ -148,6 +149,7 @@ admtmp*	at iic?			# Analog Devices ADM1030
 admtt*	at iic?			# Analog Devices ADM1031
 adt*	at iic?			# Analog Devices ADT7460
 andl*	at iic?			# Andigilog aSC7611
+bgw*	at iic?			# Bosch BMC150 6-axis eCompass
 lisa*	at iic?			# STMicroelectronics LIS331DL motion sensor
 lm*	at iic?			# National Semiconductor LM78/79
 lmenv*	at iic?			# National Semiconductor LM87
@@ -371,7 +373,7 @@ lpt0	at isa? port 0x378 irq 7	# standard PC parallel ports
 lpt*	at puc?
 
 efifb0		at mainbus?		# EFI Framebuffer
-wsdisplay0	at efifb? console 1
+wsdisplay0	at efifb? console ?
 
 ahc*	at pci?				# Adaptec 2940 SCSI controllers
 jmb*	at pci?				# JMicron JMB36x controllers
@@ -406,6 +408,7 @@ pcscp*	at pci?				# AMD 53c974 PCscsi-PCI SCSI
 #trm*	at pci?				# Tekram DC-3x5U SCSI Controllers
 vmwpvs*	at pci?				# VMware ParaVirtual SCSI
 nvme*	at pci?				# NVMe controllers
+#bwfm*	at pci?				# Broadcom FullMAC
 
 scsibus* at scsi?
 sd*	at scsibus?			# SCSI disk drives

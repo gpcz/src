@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.184 2017/05/25 03:19:39 dlg Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.186 2017/12/11 05:27:40 deraadt Exp $	*/
 /*	$NetBSD: machdep.c,v 1.108 2001/07/24 19:30:14 eeh Exp $ */
 
 /*-
@@ -217,7 +217,7 @@ cpu_startup(void)
 	/*
 	 * Good {morning,afternoon,evening,night}.
 	 */
-	printf(version);
+	printf("%s", version);
 	/*identifycpu();*/
 	printf("real mem = %lu (%luMB)\n", ptoa((psize_t)physmem),
 	    ptoa((psize_t)physmem)/1024/1024);
@@ -626,7 +626,7 @@ boot(int howto)
 		extern int sparc_clock_time_is_ok;
 
 		waittime = 0;
-		vfs_shutdown();
+		vfs_shutdown(curproc);
 
 		/*
 		 * XXX

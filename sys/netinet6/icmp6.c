@@ -1,4 +1,4 @@
-/*	$OpenBSD: icmp6.c,v 1.219 2017/10/18 17:01:14 bluhm Exp $	*/
+/*	$OpenBSD: icmp6.c,v 1.221 2017/12/14 14:26:50 bluhm Exp $	*/
 /*	$KAME: icmp6.c,v 1.217 2001/06/20 15:03:29 jinmei Exp $	*/
 
 /*
@@ -431,6 +431,11 @@ icmp6_input(struct mbuf **mp, int *offp, int proto, int af)
 		case ICMP6_PACKET_TOO_BIG:
 		case ICMP6_TIME_EXCEEDED:
 		case ICMP6_PARAM_PROB:
+			/*
+			 * Do not use the divert-to property of the TCP or UDP
+			 * rule when doing the PCB lookup for the raw socket.
+			 */
+			m->m_pkthdr.pf.flags &=~ PF_TAG_DIVERTED;
 			break;
 		default:
 			goto raw;
@@ -637,32 +642,23 @@ icmp6_input(struct mbuf **mp, int *offp, int proto, int af)
 		break;
 
 	case ND_ROUTER_SOLICIT:
-		if (code != 0)
-			goto badcode;
-		if (icmp6len < sizeof(struct nd_router_solicit))
-			goto badlen;
-		if ((n = m_copym(m, 0, M_COPYALL, M_DONTWAIT)) == NULL) {
-			/* give up local */
-			nd6_rs_input(m, off, icmp6len);
-			m = NULL;
-			goto freeit;
-		}
-		nd6_rs_input(n, off, icmp6len);
-		/* m stays. */
-		break;
-
 	case ND_ROUTER_ADVERT:
 		if (code != 0)
 			goto badcode;
-		if (icmp6len < sizeof(struct nd_router_advert))
+		if ((icmp6->icmp6_type == ND_ROUTER_SOLICIT && icmp6len <
+		    sizeof(struct nd_router_solicit)) ||
+		    (icmp6->icmp6_type == ND_ROUTER_ADVERT && icmp6len <
+		    sizeof(struct nd_router_advert)))
 			goto badlen;
+
 		if ((n = m_copym(m, 0, M_COPYALL, M_DONTWAIT)) == NULL) {
 			/* give up local */
-			nd6_ra_input(m, off, icmp6len);
+			nd6_rtr_cache(m, off, icmp6len,
+			    icmp6->icmp6_type);
 			m = NULL;
 			goto freeit;
 		}
-		nd6_ra_input(n, off, icmp6len);
+		nd6_rtr_cache(n, off, icmp6len, icmp6->icmp6_type);
 		/* m stays. */
 		break;
 

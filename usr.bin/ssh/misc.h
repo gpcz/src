@@ -1,4 +1,4 @@
-/* $OpenBSD: misc.h,v 1.63 2017/08/18 05:48:04 djm Exp $ */
+/* $OpenBSD: misc.h,v 1.69 2017/12/05 23:59:47 dtucker Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -48,13 +48,18 @@ char	*strdelim(char **);
 int	 set_nonblock(int);
 int	 unset_nonblock(int);
 void	 set_nodelay(int);
+int	 set_reuseaddr(int);
+char	*get_rdomain(int);
+int	 set_rdomain(int, const char *);
 int	 a2port(const char *);
 int	 a2tun(const char *, int *);
 char	*put_host_port(const char *, u_short);
 char	*hpdelim(char **);
 char	*cleanhostname(char *);
 char	*colon(char *);
+int	 parse_user_host_path(const char *, char **, char **, char **);
 int	 parse_user_host_port(const char *, char **, char **, int *);
+int	 parse_uri(const char *, const char *, char **, char **, int *, char **);
 long	 convtime(const char *);
 char	*tilde_expand_filename(const char *, uid_t);
 char	*percent_expand(const char *, ...) __attribute__((__sentinel__));
@@ -62,10 +67,14 @@ char	*tohex(const void *, size_t);
 void	 sanitise_stdfd(void);
 void	 ms_subtract_diff(struct timeval *, int *);
 void	 ms_to_timeval(struct timeval *, int);
+void	 monotime_ts(struct timespec *);
+void	 monotime_tv(struct timeval *);
 time_t	 monotime(void);
 double	 monotime_double(void);
 void	 lowercase(char *s);
 int	 unix_listener(const char *, int, int);
+int	 valid_domain(char *, int, const char **);
+const char *atoi_err(const char *, int *);
 
 struct passwd *pwcopy(struct passwd *);
 const char *ssh_gai_strerror(int);
@@ -82,7 +91,7 @@ void	 replacearg(arglist *, u_int, char *, ...)
 	     __attribute__((format(printf, 3, 4)));
 void	 freeargs(arglist *);
 
-int	 tun_open(int, int);
+int	 tun_open(int, int, char **);
 
 /* Common definitions for ssh tunnel device forwarding */
 #define SSH_TUNMODE_NO		0x00

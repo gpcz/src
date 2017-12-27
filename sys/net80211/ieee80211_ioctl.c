@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_ioctl.c,v 1.53 2017/07/19 22:04:46 stsp Exp $	*/
+/*	$OpenBSD: ieee80211_ioctl.c,v 1.58 2017/11/27 20:54:38 stsp Exp $	*/
 /*	$NetBSD: ieee80211_ioctl.c,v 1.15 2004/05/06 02:58:16 dyoung Exp $	*/
 
 /*-
@@ -55,8 +55,6 @@ void	 ieee80211_node2req(struct ieee80211com *,
 	    const struct ieee80211_node *, struct ieee80211_nodereq *);
 void	 ieee80211_req2node(struct ieee80211com *,
 	    const struct ieee80211_nodereq *, struct ieee80211_node *);
-void	 ieee80211_disable_wep(struct ieee80211com *); 
-void	 ieee80211_disable_rsn(struct ieee80211com *); 
 
 void
 ieee80211_node2req(struct ieee80211com *ic, const struct ieee80211_node *ni,
@@ -254,8 +252,7 @@ static int
 ieee80211_ioctl_getnwkeys(struct ieee80211com *ic,
     struct ieee80211_nwkey *nwkey)
 {
-	struct ieee80211_key *k;
-	int error, i;
+	int i;
 
 	if (ic->ic_flags & IEEE80211_F_WEPON)
 		nwkey->i_wepon = IEEE80211_NWKEY_WEP;
@@ -267,19 +264,8 @@ ieee80211_ioctl_getnwkeys(struct ieee80211com *ic,
 	for (i = 0; i < IEEE80211_WEP_NKID; i++) {
 		if (nwkey->i_key[i].i_keydat == NULL)
 			continue;
-		/* do not show any keys to non-root user */
-		if ((error = suser(curproc, 0)) != 0)
-			return error;
-		k = &ic->ic_nw_keys[i];
-		if (k->k_cipher != IEEE80211_CIPHER_WEP40 &&
-		    k->k_cipher != IEEE80211_CIPHER_WEP104)
-			nwkey->i_key[i].i_keylen = 0;
-		else
-			nwkey->i_key[i].i_keylen = k->k_len;
-		error = copyout(k->k_key, nwkey->i_key[i].i_keydat,
-		    nwkey->i_key[i].i_keylen);
-		if (error != 0)
-			return error;
+		/* do not show any keys to userland */
+		return EPERM;
 	}
 	return 0;
 }
@@ -407,7 +393,6 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	int i, error = 0;
 	struct ieee80211_nwid nwid;
 	struct ieee80211_wpapsk *psk;
-	struct ieee80211_wmmparams *wmm;
 	struct ieee80211_keyavail *ka;
 	struct ieee80211_keyrun *kr;
 	struct ieee80211_power *power;
@@ -440,6 +425,9 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
 		ic->ic_des_esslen = nwid.i_len;
 		memcpy(ic->ic_des_essid, nwid.i_nwid, nwid.i_len);
+		/* disable WPA/WEP */
+		ieee80211_disable_rsn(ic);
+		ieee80211_disable_wep(ic);
 		error = ENETRESET;
 		break;
 	case SIOCG80211NWID:
@@ -464,24 +452,6 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 	case SIOCG80211NWKEY:
 		error = ieee80211_ioctl_getnwkeys(ic, (void *)data);
-		break;
-	case SIOCS80211WMMPARMS:
-		if ((error = suser(curproc, 0)) != 0)
-			break;
-		if (!(ic->ic_flags & IEEE80211_C_QOS)) {
-			error = ENODEV;
-			break;
-		}
-		wmm = (struct ieee80211_wmmparams *)data;
-		if (wmm->i_enabled)
-			ic->ic_flags |= IEEE80211_F_QOS;
-		else
-			ic->ic_flags &= ~IEEE80211_F_QOS;
-		error = ENETRESET;
-		break;
-	case SIOCG80211WMMPARMS:
-		wmm = (struct ieee80211_wmmparams *)data;
-		wmm->i_enabled = (ic->ic_flags & IEEE80211_F_QOS) ? 1 : 0;
 		break;
 	case SIOCS80211WPAPARMS:
 		if ((error = suser(curproc, 0)) != 0)
@@ -509,14 +479,10 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	case SIOCG80211WPAPSK:
 		psk = (struct ieee80211_wpapsk *)data;
 		if (ic->ic_flags & IEEE80211_F_PSK) {
-			psk->i_enabled = 1;
-			/* do not show any keys to non-root user */
-			if (suser(curproc, 0) != 0) {
-				psk->i_enabled = 2;
-				memset(psk->i_psk, 0, sizeof(psk->i_psk));
-				break;	/* return ok but w/o key */
-			}
-			memcpy(psk->i_psk, ic->ic_psk, sizeof(psk->i_psk));
+			/* do not show any keys to userland */
+			psk->i_enabled = 2;
+			memset(psk->i_psk, 0, sizeof(psk->i_psk));
+			break;	/* return ok but w/o key */
 		} else
 			psk->i_enabled = 0;
 		break;
@@ -840,6 +806,14 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		}
 		ic->ic_flags = (ic->ic_flags & ~IEEE80211_F_USERMASK) | flags;
 		error = ENETRESET;
+		break;
+	case SIOCADDMULTI:
+	case SIOCDELMULTI:
+		error = (cmd == SIOCADDMULTI) ?
+		    ether_addmulti(ifr, &ic->ic_ac) :
+		    ether_delmulti(ifr, &ic->ic_ac);
+		if (error == ENETRESET)
+			error = 0;
 		break;
 	default:
 		error = ether_ioctl(ifp, &ic->ic_ac, cmd, data);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if.h,v 1.186 2017/01/24 10:08:30 krw Exp $	*/
+/*	$OpenBSD: if.h,v 1.189 2017/12/21 01:11:47 dlg Exp $	*/
 /*	$NetBSD: if.h,v 1.23 1996/05/07 02:40:27 thorpej Exp $	*/
 
 /*
@@ -463,6 +463,7 @@ void	if_alloc_sadl(struct ifnet *);
 void	if_free_sadl(struct ifnet *);
 void	if_attach(struct ifnet *);
 void	if_attach_queues(struct ifnet *, unsigned int);
+void	if_attach_iqueues(struct ifnet *, unsigned int);
 void	if_attach_ifq(struct ifnet *, const struct ifq_ops *, void *);
 void	if_attachtail(struct ifnet *);
 void	if_attachhead(struct ifnet *);
@@ -472,7 +473,6 @@ void	if_down(struct ifnet *);
 void	if_downall(void);
 void	if_link_state_change(struct ifnet *);
 void	if_up(struct ifnet *);
-int	ifconf(u_long, caddr_t);
 void	if_getdata(struct ifnet *, struct if_data *);
 void	ifinit(void);
 int	ifioctl(struct socket *, u_long, caddr_t, struct proc *);
@@ -489,6 +489,7 @@ void	if_congestion(void);
 int	if_congested(void);
 __dead void	unhandled_af(int);
 int	if_setlladdr(struct ifnet *, const uint8_t *);
+struct taskq * net_tq(unsigned int);
 
 #endif /* _KERNEL */
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: s_time.c,v 1.17 2017/01/20 08:57:12 deraadt Exp $ */
+/* $OpenBSD: s_time.c,v 1.19 2017/12/05 15:02:06 jca Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -233,9 +233,9 @@ s_time_usage(void)
 #define STOP	1
 
 static double
-tm_Time_F(int s)
+tm_Time_F(int op)
 {
-	return app_tminterval(s, 1);
+	return app_timer_user(op);
 }
 
 /***********************************************************************
@@ -254,7 +254,7 @@ s_time_main(int argc, char **argv)
 	int ver;
 
 	if (single_execution) {
-		if (pledge("stdio rpath inet", NULL) == -1) {
+		if (pledge("stdio rpath inet dns", NULL) == -1) {
 			perror("pledge");
 			exit(1);
 		}

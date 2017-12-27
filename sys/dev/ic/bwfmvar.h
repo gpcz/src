@@ -1,4 +1,4 @@
-/* $OpenBSD: bwfmvar.h,v 1.2 2017/10/18 19:59:37 patrick Exp $ */
+/* $OpenBSD: bwfmvar.h,v 1.5 2017/12/16 23:39:58 patrick Exp $ */
 /*
  * Copyright (c) 2010-2016 Broadcom Corporation
  * Copyright (c) 2016,2017 Patrick Wildt <patrick@blueri.se>
@@ -32,7 +32,9 @@
 #define BRCM_CC_4339_CHIP_ID		0x4339
 #define BRCM_CC_43430_CHIP_ID		43430
 #define BRCM_CC_4345_CHIP_ID		0x4345
+#define BRCM_CC_43465_CHIP_ID		43465
 #define BRCM_CC_4350_CHIP_ID		0x4350
+#define BRCM_CC_43525_CHIP_ID		43525
 #define BRCM_CC_4354_CHIP_ID		0x4354
 #define BRCM_CC_4356_CHIP_ID		0x4356
 #define BRCM_CC_43566_CHIP_ID		43566
@@ -45,6 +47,7 @@
 #define BRCM_CC_4365_CHIP_ID		0x4365
 #define BRCM_CC_4366_CHIP_ID		0x4366
 #define BRCM_CC_4371_CHIP_ID		0x4371
+#define CY_CC_4373_CHIP_ID		0x4373
 
 /* Defaults */
 #define BWFM_DEFAULT_SCAN_CHANNEL_TIME	40
@@ -106,6 +109,29 @@ struct bwfm_proto_ops {
 };
 extern struct bwfm_proto_ops bwfm_proto_bcdc_ops;
 
+struct bwfm_host_cmd {
+	void	 (*cb)(struct bwfm_softc *, void *);
+	uint8_t	 data[256];
+};
+
+struct bwfm_cmd_newstate {
+	enum ieee80211_state	 state;
+	int			 arg;
+};
+
+struct bwfm_cmd_key {
+	struct ieee80211_node	 *ni;
+	struct ieee80211_key	 *k;
+};
+
+struct bwfm_host_cmd_ring {
+#define BWFM_HOST_CMD_RING_COUNT	32
+	struct bwfm_host_cmd	 cmd[BWFM_HOST_CMD_RING_COUNT];
+	int			 cur;
+	int			 next;
+	int			 queued;
+};
+
 struct bwfm_softc {
 	struct device		 sc_dev;
 	struct ieee80211com	 sc_ic;
@@ -119,12 +145,19 @@ struct bwfm_softc {
 #define		BWFM_IO_TYPE_D11AC		2
 
 	int			 sc_tx_timer;
-	struct timeout		 sc_scan_timeout;
+
+	int			 (*sc_newstate)(struct ieee80211com *,
+				     enum ieee80211_state, int);
+	struct bwfm_host_cmd_ring sc_cmdq;
+	struct taskq		*sc_taskq;
+	struct task		 sc_task;
 };
 
 void bwfm_attach(struct bwfm_softc *);
 int bwfm_detach(struct bwfm_softc *, int);
 int bwfm_chip_attach(struct bwfm_softc *);
+int bwfm_chip_set_active(struct bwfm_softc *, uint32_t);
+void bwfm_chip_set_passive(struct bwfm_softc *);
 struct bwfm_core *bwfm_chip_get_core(struct bwfm_softc *, int);
 struct bwfm_core *bwfm_chip_get_pmu(struct bwfm_softc *);
 void bwfm_rx(struct bwfm_softc *, char *, size_t);

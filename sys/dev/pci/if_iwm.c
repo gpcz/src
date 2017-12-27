@@ -1,9 +1,10 @@
-/*	$OpenBSD: if_iwm.c,v 1.214 2017/10/04 18:00:12 stsp Exp $	*/
+/*	$OpenBSD: if_iwm.c,v 1.222 2017/12/10 20:34:41 stsp Exp $	*/
 
 /*
  * Copyright (c) 2014, 2016 genua gmbh <info@genua.de>
  *   Author: Stefan Sperling <stsp@openbsd.org>
  * Copyright (c) 2014 Fixup Software Ltd.
+ * Copyright (c) 2017 Stefan Sperling <stsp@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -419,9 +420,9 @@ uint32_t iwm_scan_rate_n_flags(struct iwm_softc *, int, int);
 uint8_t	iwm_lmac_scan_fill_channels(struct iwm_softc *,
 	    struct iwm_scan_channel_cfg_lmac *, int);
 int	iwm_fill_probe_req(struct iwm_softc *, struct iwm_scan_probe_req *);
-int	iwm_lmac_scan(struct iwm_softc *);
+int	iwm_lmac_scan(struct iwm_softc *, int);
 int	iwm_config_umac_scan(struct iwm_softc *);
-int	iwm_umac_scan(struct iwm_softc *);
+int	iwm_umac_scan(struct iwm_softc *, int);
 uint8_t	iwm_ridx2rate(struct ieee80211_rateset *, int);
 int	iwm_rval2ridx(int);
 void	iwm_ack_rates(struct iwm_softc *, struct iwm_node *, int *, int *);
@@ -434,6 +435,10 @@ int	iwm_update_quotas(struct iwm_softc *, struct iwm_node *, int);
 void	iwm_add_task(struct iwm_softc *, struct taskq *, struct task *);
 void	iwm_del_task(struct iwm_softc *, struct taskq *, struct task *);
 int	iwm_scan(struct iwm_softc *);
+int	iwm_bgscan(struct ieee80211com *);
+int	iwm_umac_scan_abort(struct iwm_softc *);
+int	iwm_lmac_scan_abort(struct iwm_softc *);
+int	iwm_scan_abort(struct iwm_softc *);
 int	iwm_auth(struct iwm_softc *);
 int	iwm_deauth(struct iwm_softc *);
 int	iwm_assoc(struct iwm_softc *);
@@ -2204,12 +2209,13 @@ iwm_send_time_event_cmd(struct iwm_softc *sc,
     const struct iwm_time_event_cmd_v2 *cmd)
 {
 	struct iwm_time_event_cmd_v1 cmd_v1;
-	struct iwm_host_cmd hcmd = {
-		.id = IWM_TIME_EVENT_CMD,
-		.flags = IWM_CMD_WANT_SKB,
-	};
 	struct iwm_rx_packet *pkt;
 	struct iwm_time_event_resp *resp;
+	struct iwm_host_cmd hcmd = {
+		.id = IWM_TIME_EVENT_CMD,
+		.flags = IWM_CMD_WANT_RESP,
+		.resp_pkt_len = sizeof(*pkt) + sizeof(*resp),
+	};
 	uint32_t resp_len;
 	int err;
 
@@ -2343,7 +2349,8 @@ iwm_nvm_read_chunk(struct iwm_softc *sc, uint16_t section, uint16_t offset,
 	struct iwm_rx_packet *pkt;
 	struct iwm_host_cmd cmd = {
 		.id = IWM_NVM_ACCESS_CMD,
-		.flags = (IWM_CMD_WANT_SKB | IWM_CMD_SEND_IN_RFKILL),
+		.flags = (IWM_CMD_WANT_RESP | IWM_CMD_SEND_IN_RFKILL),
+		.resp_pkt_len = IWM_CMD_RESP_MAX,
 		.data = { &nvm_access_cmd, },
 	};
 	int err, offset_read;
@@ -2364,6 +2371,8 @@ iwm_nvm_read_chunk(struct iwm_softc *sc, uint16_t section, uint16_t offset,
 
 	/* Extract NVM response */
 	nvm_resp = (void *)pkt->data;
+	if (nvm_resp == NULL)
+		return EIO;
 
 	err = le16toh(nvm_resp->status);
 	bytes_read = le16toh(nvm_resp->length);
@@ -3426,6 +3435,7 @@ iwm_rx_rx_mpdu(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 	struct ieee80211_frame *wh;
 	struct ieee80211_node *ni;
 	struct ieee80211_rxinfo rxi;
+	struct ieee80211_channel *bss_chan;
 	struct mbuf *m;
 	struct iwm_rx_phy_info *phy_info;
 	struct iwm_rx_mpdu_res_start *rx_res;
@@ -3480,7 +3490,15 @@ iwm_rx_rx_mpdu(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 	chanidx = letoh32(phy_info->channel);
 	if (chanidx < 0 || chanidx >= nitems(ic->ic_channels))	
 		chanidx = ieee80211_chan2ieee(ic, ic->ic_ibss_chan);
+
 	ni = ieee80211_find_rxnode(ic, wh);
+	if (ni == ic->ic_bss) {
+		/* 
+		 * We may switch ic_bss's channel during scans.
+		 * Record the current channel so we can restore it later.
+		 */
+		bss_chan = ni->ni_chan;
+	}
 	ni->ni_chan = &ic->ic_channels[chanidx];
 
 	memset(&rxi, 0, sizeof(rxi));
@@ -3544,6 +3562,8 @@ iwm_rx_rx_mpdu(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 	}
 #endif
 	ieee80211_input(IC2IFP(ic), m, ni, &rxi);
+	if (ni == ic->ic_bss)
+		ni->ni_chan = bss_chan;
 	ieee80211_release_node(ic, ni);
 }
 
@@ -3773,40 +3793,42 @@ iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 	bus_addr_t paddr;
 	uint32_t addr_lo;
 	int err = 0, i, paylen, off, s;
-	int code;
-	int async, wantresp;
-	int group_id;
+	int idx, code, async, group_id;
 	size_t hdrlen, datasz;
 	uint8_t *data;
 	int generation = sc->sc_generation;
 
 	code = hcmd->id;
 	async = hcmd->flags & IWM_CMD_ASYNC;
-	wantresp = hcmd->flags & IWM_CMD_WANT_SKB;
+	idx = ring->cur;
 
 	for (i = 0, paylen = 0; i < nitems(hcmd->len); i++) {
 		paylen += hcmd->len[i];
 	}
 
-	/* if the command wants an answer, busy sc_cmd_resp */
-	if (wantresp) {
+	/* If this command waits for a response, allocate response buffer. */
+	hcmd->resp_pkt = NULL;
+	if (hcmd->flags & IWM_CMD_WANT_RESP) {
+		uint8_t *resp_buf;
 		KASSERT(!async);
-		while (sc->sc_wantresp != IWM_CMD_RESP_IDLE)
-			tsleep(&sc->sc_wantresp, 0, "iwmcmdsl", 0);
-		sc->sc_wantresp = ring->qid << 16 | ring->cur;
+		KASSERT(hcmd->resp_pkt_len >= sizeof(struct iwm_rx_packet));
+		KASSERT(hcmd->resp_pkt_len <= IWM_CMD_RESP_MAX);
+		if (sc->sc_cmd_resp_pkt[idx] != NULL)
+			return ENOSPC;
+		resp_buf = malloc(hcmd->resp_pkt_len, M_DEVBUF,
+		    M_NOWAIT | M_ZERO);
+		if (resp_buf == NULL)
+			return ENOMEM;
+		sc->sc_cmd_resp_pkt[idx] = resp_buf;
+		sc->sc_cmd_resp_len[idx] = hcmd->resp_pkt_len;
+	} else {
+		sc->sc_cmd_resp_pkt[idx] = NULL;
 	}
 
-	/*
-	 * Is the hardware still available?  (after e.g. above wait).
-	 */
 	s = splnet();
-	if (generation != sc->sc_generation) {
-		err = ENXIO;
-		goto out;
-	}
 
-	desc = &ring->desc[ring->cur];
-	txdata = &ring->data[ring->cur];
+	desc = &ring->desc[idx];
+	txdata = &ring->data[idx];
 
 	group_id = iwm_cmd_groupid(code);
 	if (group_id != 0) {
@@ -3845,7 +3867,7 @@ iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 		txdata->m = m; /* mbuf will be freed in iwm_cmd_done() */
 		paddr = txdata->map->dm_segs[0].ds_addr;
 	} else {
-		cmd = &ring->cmd[ring->cur];
+		cmd = &ring->cmd[idx];
 		paddr = txdata->cmd_paddr;
 	}
 
@@ -3853,7 +3875,7 @@ iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 		cmd->hdr_wide.opcode = iwm_cmd_opcode(code);
 		cmd->hdr_wide.group_id = group_id;
 		cmd->hdr_wide.qid = ring->qid;
-		cmd->hdr_wide.idx = ring->cur;
+		cmd->hdr_wide.idx = idx;
 		cmd->hdr_wide.length = htole16(paylen);
 		cmd->hdr_wide.version = iwm_cmd_version(code);
 		data = cmd->data_wide;
@@ -3861,7 +3883,7 @@ iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 		cmd->hdr.code = code;
 		cmd->hdr.flags = 0;
 		cmd->hdr.qid = ring->qid;
-		cmd->hdr.idx = ring->cur;
+		cmd->hdr.idx = idx;
 		data = cmd->data;
 	}
 
@@ -3918,15 +3940,19 @@ iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 			/* if hardware is no longer up, return error */
 			if (generation != sc->sc_generation) {
 				err = ENXIO;
-			} else {
-				hcmd->resp_pkt = (void *)sc->sc_cmd_resp;
+				goto out;
 			}
+
+			/* Response buffer will be freed in iwm_free_resp(). */
+			hcmd->resp_pkt = (void *)sc->sc_cmd_resp_pkt[idx];
+			sc->sc_cmd_resp_pkt[idx] = NULL;
+		} else if (generation == sc->sc_generation) {
+			free(sc->sc_cmd_resp_pkt[idx], M_DEVBUF,
+			    sc->sc_cmd_resp_len[idx]);
+			sc->sc_cmd_resp_pkt[idx] = NULL;	
 		}
 	}
  out:
-	if (wantresp && err) {
-		iwm_free_resp(sc, hcmd);
-	}
 	splx(s);
 
 	return err;
@@ -3954,34 +3980,26 @@ iwm_send_cmd_status(struct iwm_softc *sc, struct iwm_host_cmd *cmd,
 	struct iwm_cmd_response *resp;
 	int err, resp_len;
 
-	KASSERT((cmd->flags & IWM_CMD_WANT_SKB) == 0);
-	cmd->flags |= IWM_CMD_WANT_SKB;
+	KASSERT((cmd->flags & IWM_CMD_WANT_RESP) == 0);
+	cmd->flags |= IWM_CMD_WANT_RESP;
+	cmd->resp_pkt_len = sizeof(*pkt) + sizeof(*resp);
 
 	err = iwm_send_cmd(sc, cmd);
 	if (err)
 		return err;
+
 	pkt = cmd->resp_pkt;
-
-	/* Can happen if RFKILL is asserted */
-	if (!pkt) {
-		err = 0;
-		goto out_free_resp;
-	}
-
-	if (pkt->hdr.flags & IWM_CMD_FAILED_MSK) {
-		err = EIO;
-		goto out_free_resp;
-	}
+	if (pkt == NULL || (pkt->hdr.flags & IWM_CMD_FAILED_MSK))
+		return EIO;
 
 	resp_len = iwm_rx_packet_payload_len(pkt);
 	if (resp_len != sizeof(*resp)) {
-		err = EIO;
-		goto out_free_resp;
+		iwm_free_resp(sc, cmd);
+		return EIO;
 	}
 
 	resp = (void *)pkt->data;
 	*status = le32toh(resp->status);
- out_free_resp:
 	iwm_free_resp(sc, cmd);
 	return err;
 }
@@ -4002,10 +4020,9 @@ iwm_send_cmd_pdu_status(struct iwm_softc *sc, uint32_t id, uint16_t len,
 void
 iwm_free_resp(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 {
-	KASSERT(sc->sc_wantresp != IWM_CMD_RESP_IDLE);
-	KASSERT((hcmd->flags & (IWM_CMD_WANT_SKB)) == IWM_CMD_WANT_SKB);
-	sc->sc_wantresp = IWM_CMD_RESP_IDLE;
-	wakeup(&sc->sc_wantresp);
+	KASSERT((hcmd->flags & (IWM_CMD_WANT_RESP)) == IWM_CMD_WANT_RESP);
+	free(hcmd->resp_pkt, M_DEVBUF, hcmd->resp_pkt_len);
+	hcmd->resp_pkt = NULL;
 }
 
 void
@@ -4481,11 +4498,7 @@ iwm_power_build_cmd(struct iwm_softc *sc, struct iwm_node *in,
 	keep_alive = roundup(keep_alive, 1000) / 1000;
 	cmd->keep_alive_seconds = htole16(keep_alive);
 
-#ifdef notyet
 	cmd->flags = htole16(IWM_POWER_FLAGS_POWER_SAVE_ENA_MSK);
-	cmd->rx_data_timeout = IWM_DEFAULT_PS_RX_DATA_TIMEOUT;
-	cmd->tx_data_timeout = IWM_DEFAULT_PS_TX_DATA_TIMEOUT;
-#endif
 }
 
 int
@@ -4513,15 +4526,11 @@ int
 iwm_power_update_device(struct iwm_softc *sc)
 {
 	struct iwm_device_power_cmd cmd = {
-#ifdef notyet
 		.flags = htole16(IWM_DEVICE_POWER_FLAGS_POWER_SAVE_ENA_MSK),
-#endif
 	};
 
 	if (!(sc->sc_capaflags & IWM_UCODE_TLV_FLAGS_DEVICE_PS_CMD))
 		return 0;
-
-	cmd.flags |= htole16(IWM_DEVICE_POWER_FLAGS_CAM_MSK);
 
 	return iwm_send_cmd_pdu(sc,
 	    IWM_POWER_TABLE_CMD, 0, sizeof(cmd), &cmd);
@@ -4866,7 +4875,7 @@ iwm_fill_probe_req(struct iwm_softc *sc, struct iwm_scan_probe_req *preq)
 }
 
 int
-iwm_lmac_scan(struct iwm_softc *sc)
+iwm_lmac_scan(struct iwm_softc *sc, int bgscan)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_host_cmd hcmd = {
@@ -4877,28 +4886,34 @@ iwm_lmac_scan(struct iwm_softc *sc)
 	};
 	struct iwm_scan_req_lmac *req;
 	size_t req_len;
-	int err;
+	int err, async = bgscan;
 
 	req_len = sizeof(struct iwm_scan_req_lmac) +
 	    (sizeof(struct iwm_scan_channel_cfg_lmac) *
 	    sc->sc_capa_n_scan_channels) + sizeof(struct iwm_scan_probe_req);
 	if (req_len > IWM_MAX_CMD_PAYLOAD_SIZE)
 		return ENOMEM;
-	req = malloc(req_len, M_DEVBUF, M_WAIT | M_CANFAIL | M_ZERO);
+	req = malloc(req_len, M_DEVBUF,
+	    (async ? M_NOWAIT : M_WAIT) | M_CANFAIL | M_ZERO);
 	if (req == NULL)
 		return ENOMEM;
 
 	hcmd.len[0] = (uint16_t)req_len;
 	hcmd.data[0] = (void *)req;
+	hcmd.flags |= async ? IWM_CMD_ASYNC : 0;
 
 	/* These timings correspond to iwlwifi's UNASSOC scan. */
 	req->active_dwell = 10;
 	req->passive_dwell = 110;
 	req->fragmented_dwell = 44;
 	req->extended_dwell = 90;
-	req->max_out_time = 0;
-	req->suspend_time = 0;
-
+	if (bgscan) {
+		req->max_out_time = htole32(120);
+		req->suspend_time = htole32(120);
+	} else {
+		req->max_out_time = htole32(0);
+		req->suspend_time = htole32(0);
+	}
 	req->scan_prio = htole32(IWM_SCAN_PRIORITY_HIGH);
 	req->rx_chain_select = iwm_scan_rx_chain(sc);
 	req->iter_num = htole32(1);
@@ -5046,7 +5061,7 @@ iwm_config_umac_scan(struct iwm_softc *sc)
 }
 
 int
-iwm_umac_scan(struct iwm_softc *sc)
+iwm_umac_scan(struct iwm_softc *sc, int bgscan)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_host_cmd hcmd = {
@@ -5058,7 +5073,7 @@ iwm_umac_scan(struct iwm_softc *sc)
 	struct iwm_scan_req_umac *req;
 	struct iwm_scan_req_umac_tail *tail;
 	size_t req_len;
-	int err;
+	int err, async = bgscan;
 
 	req_len = sizeof(struct iwm_scan_req_umac) +
 	    (sizeof(struct iwm_scan_channel_cfg_umac) *
@@ -5066,20 +5081,27 @@ iwm_umac_scan(struct iwm_softc *sc)
 	    sizeof(struct iwm_scan_req_umac_tail);
 	if (req_len > IWM_MAX_CMD_PAYLOAD_SIZE)
 		return ENOMEM;
-	req = malloc(req_len, M_DEVBUF, M_WAIT | M_CANFAIL | M_ZERO);
+	req = malloc(req_len, M_DEVBUF,
+	    (async ? M_NOWAIT : M_WAIT) | M_CANFAIL | M_ZERO);
 	if (req == NULL)
 		return ENOMEM;
 
 	hcmd.len[0] = (uint16_t)req_len;
 	hcmd.data[0] = (void *)req;
+	hcmd.flags |= async ? IWM_CMD_ASYNC : 0;
 
 	/* These timings correspond to iwlwifi's UNASSOC scan. */
 	req->active_dwell = 10;
 	req->passive_dwell = 110;
 	req->fragmented_dwell = 44;
 	req->extended_dwell = 90;
-	req->max_out_time = 0;
-	req->suspend_time = 0;
+	if (bgscan) {
+		req->max_out_time = htole32(120);
+		req->suspend_time = htole32(120);
+	} else {
+		req->max_out_time = htole32(0);
+		req->suspend_time = htole32(0);
+	}
 
 	req->scan_priority = htole32(IWM_SCAN_PRIORITY_HIGH);
 	req->ooc_priority = htole32(IWM_SCAN_PRIORITY_HIGH);
@@ -5459,13 +5481,19 @@ iwm_scan(struct iwm_softc *sc)
 	struct ieee80211com *ic = &sc->sc_ic;
 	int err;
 
-	if (sc->sc_flags & IWM_FLAG_SCANNING)
-		return 0;
+	if (sc->sc_flags & IWM_FLAG_BGSCAN) {
+		err = iwm_scan_abort(sc);
+		if (err) {
+			printf("%s: could not abort background scan\n",
+			    DEVNAME(sc));
+			return err;
+		}
+	}
 
 	if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_UMAC_SCAN))
-		err = iwm_umac_scan(sc);
+		err = iwm_umac_scan(sc, 0);
 	else
-		err = iwm_lmac_scan(sc);
+		err = iwm_lmac_scan(sc, 0);
 	if (err) {
 		printf("%s: could not initiate scan\n", DEVNAME(sc));
 		return err;
@@ -5477,6 +5505,79 @@ iwm_scan(struct iwm_softc *sc)
 	wakeup(&ic->ic_state); /* wake iwm_init() */
 
 	return 0;
+}
+
+int
+iwm_bgscan(struct ieee80211com *ic) 
+{
+	struct iwm_softc *sc = IC2IFP(ic)->if_softc;
+	int err;
+
+	if (sc->sc_flags & IWM_FLAG_SCANNING)
+		return 0;
+
+	if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_UMAC_SCAN))
+		err = iwm_umac_scan(sc, 1);
+	else
+		err = iwm_lmac_scan(sc, 1);
+	if (err) {
+		printf("%s: could not initiate scan\n", DEVNAME(sc));
+		return err;
+	}
+
+	sc->sc_flags |= IWM_FLAG_BGSCAN;
+	return 0;
+}
+
+int
+iwm_umac_scan_abort(struct iwm_softc *sc)
+{
+	struct iwm_umac_scan_abort cmd = { 0 };
+
+	return iwm_send_cmd_pdu(sc,
+	    IWM_WIDE_ID(IWM_ALWAYS_LONG_GROUP, IWM_SCAN_ABORT_UMAC),
+	    0, sizeof(cmd), &cmd);
+}
+
+int
+iwm_lmac_scan_abort(struct iwm_softc *sc)
+{
+	struct iwm_host_cmd cmd = {
+		.id = IWM_SCAN_OFFLOAD_ABORT_CMD,
+	};
+	int err, status;
+
+	err = iwm_send_cmd_status(sc, &cmd, &status);
+	if (err)
+		return err;
+
+	if (status != IWM_CAN_ABORT_STATUS) {
+		/*
+		 * The scan abort will return 1 for success or
+		 * 2 for "failure".  A failure condition can be
+		 * due to simply not being in an active scan which
+		 * can occur if we send the scan abort before the
+		 * microcode has notified us that a scan is completed.
+		 */
+		return EBUSY;
+	}
+
+	return 0;
+}
+
+int
+iwm_scan_abort(struct iwm_softc *sc)
+{
+	int err;
+
+	if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_UMAC_SCAN))
+		err = iwm_umac_scan_abort(sc);
+	else
+		err = iwm_lmac_scan_abort(sc);
+
+	if (err == 0)
+		sc->sc_flags &= ~(IWM_FLAG_SCANNING | IWM_FLAG_BGSCAN);
+	return err;
 }
 
 int
@@ -5984,17 +6085,27 @@ iwm_newstate_task(void *psc)
 	    ieee80211_state_name[ostate],
 	    ieee80211_state_name[nstate]));
 
-	if (nstate == ostate || (sc->sc_flags & IWM_FLAG_SHUTDOWN)) {
-		/* No-op state change or iwm_stop() is waiting for us. */
+	if (sc->sc_flags & IWM_FLAG_SHUTDOWN) {
+		/* iwm_stop() is waiting for us. */
 		refcnt_rele_wake(&sc->task_refs);
 		splx(s);
 		return;
 	}
 
-	if (ostate == IEEE80211_S_SCAN)
-		iwm_led_blink_stop(sc);
+	if (ostate == IEEE80211_S_SCAN) {
+		if (nstate == ostate) {
+			if (sc->sc_flags & IWM_FLAG_SCANNING) {
+				refcnt_rele_wake(&sc->task_refs);
+				splx(s);
+				return;
+			}
+			/* Firmware is no longer scanning. Do another scan. */
+			goto next_scan;
+		} else
+			iwm_led_blink_stop(sc);
+	}
 
-	if (nstate < ostate) {
+	if (nstate <= ostate) {
 		switch (ostate) {
 		case IEEE80211_S_RUN:
 			err = iwm_run_stop(sc);
@@ -6033,6 +6144,7 @@ iwm_newstate_task(void *psc)
 		break;
 
 	case IEEE80211_S_SCAN:
+next_scan:
 		err = iwm_scan(sc);
 		if (err)
 			break;
@@ -6054,8 +6166,12 @@ iwm_newstate_task(void *psc)
 	}
 
 out:
-	if (err == 0 && (sc->sc_flags & IWM_FLAG_SHUTDOWN) == 0)
-		sc->sc_newstate(ic, nstate, arg);
+	if ((sc->sc_flags & IWM_FLAG_SHUTDOWN) == 0) {
+		if (err)
+			task_add(systq, &sc->init_task);
+		else
+			sc->sc_newstate(ic, nstate, arg);
+	}
 	refcnt_rele_wake(&sc->task_refs);
 	splx(s);
 }
@@ -6088,10 +6204,10 @@ iwm_endscan(struct iwm_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 
-	if ((sc->sc_flags & IWM_FLAG_SCANNING) == 0)
+	if ((sc->sc_flags & (IWM_FLAG_SCANNING | IWM_FLAG_BGSCAN)) == 0)
 		return;
 
-	sc->sc_flags &= ~IWM_FLAG_SCANNING;
+	sc->sc_flags &= ~(IWM_FLAG_SCANNING | IWM_FLAG_BGSCAN);
 	ieee80211_end_scan(&ic->ic_if);
 }
 
@@ -6242,7 +6358,7 @@ iwm_send_update_mcc_cmd(struct iwm_softc *sc, const char *alpha2)
 	struct iwm_mcc_update_cmd mcc_cmd;
 	struct iwm_host_cmd hcmd = {
 		.id = IWM_MCC_UPDATE_CMD,
-		.flags = IWM_CMD_WANT_SKB,
+		.flags = IWM_CMD_WANT_RESP,
 		.data = { &mcc_cmd },
 	};
 	int err;
@@ -6257,10 +6373,15 @@ iwm_send_update_mcc_cmd(struct iwm_softc *sc, const char *alpha2)
 	else
 		mcc_cmd.source_id = IWM_MCC_SOURCE_OLD_FW;
 
-	if (resp_v2)
+	if (resp_v2) {
 		hcmd.len[0] = sizeof(struct iwm_mcc_update_cmd);
-	else
+		hcmd.resp_pkt_len = sizeof(struct iwm_rx_packet) +
+		    sizeof(struct iwm_mcc_update_resp);
+	} else {
 		hcmd.len[0] = sizeof(struct iwm_mcc_update_cmd_v1);
+		hcmd.resp_pkt_len = sizeof(struct iwm_rx_packet) +
+		    sizeof(struct iwm_mcc_update_resp_v1);
+	}
 
 	err = iwm_send_cmd(sc, &hcmd);
 	if (err)
@@ -6517,9 +6638,10 @@ iwm_start(struct ifnet *ifp)
 			ni = m->m_pkthdr.ph_cookie;
 			goto sendit;
 		}
-		if (ic->ic_state != IEEE80211_S_RUN) {
+
+		if (ic->ic_state != IEEE80211_S_RUN ||
+		    (ic->ic_xflags & IEEE80211_F_TX_MGMT_ONLY))
 			break;
-		}
 
 		IFQ_DEQUEUE(&ifp->if_snd, m);
 		if (!m)
@@ -6564,7 +6686,7 @@ iwm_stop(struct ifnet *ifp)
 	struct iwm_softc *sc = ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_node *in = (void *)ic->ic_bss;
-	int s = splnet();
+	int i, s = splnet();
 
 	rw_assert_wrlock(&sc->ioctl_rwl);
 
@@ -6584,6 +6706,11 @@ iwm_stop(struct ifnet *ifp)
 	/* Reset soft state. */
 
 	sc->sc_generation++;
+	for (i = 0; i < nitems(sc->sc_cmd_resp_pkt); i++) {
+		free(sc->sc_cmd_resp_pkt[i], M_DEVBUF, sc->sc_cmd_resp_len[i]);
+		sc->sc_cmd_resp_pkt[i] = NULL;
+		sc->sc_cmd_resp_len[i] = 0;
+	}
 	if (ic->ic_scan_lock & IEEE80211_SCAN_REQUEST)
 		wakeup(&ic->ic_scan_lock);
 	ic->ic_scan_lock = IEEE80211_SCAN_UNLOCKED;
@@ -6594,7 +6721,7 @@ iwm_stop(struct ifnet *ifp)
 	if (ic->ic_state == IEEE80211_S_RUN)
 		ieee80211_mira_cancel_timeouts(&in->in_mn); /* XXX refcount? */
 
-	sc->sc_flags &= ~IWM_FLAG_SCANNING;
+	sc->sc_flags &= ~(IWM_FLAG_SCANNING | IWM_FLAG_BGSCAN);
 	sc->sc_flags &= ~IWM_FLAG_MAC_ACTIVE;
 	sc->sc_flags &= ~IWM_FLAG_BINDING_ACTIVE;
 	sc->sc_flags &= ~IWM_FLAG_STA_ACTIVE;
@@ -6638,8 +6765,6 @@ int
 iwm_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
 	struct iwm_softc *sc = ifp->if_softc;
-	struct ieee80211com *ic = &sc->sc_ic;
-	struct ifreq *ifr;
 	int s, err = 0, generation = sc->sc_generation;
 
 	/*
@@ -6668,16 +6793,6 @@ iwm_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			if (ifp->if_flags & IFF_RUNNING)
 				iwm_stop(ifp);
 		}
-		break;
-
-	case SIOCADDMULTI:
-	case SIOCDELMULTI:
-		ifr = (struct ifreq *)data;
-		err = (cmd == SIOCADDMULTI) ?
-		    ether_addmulti(ifr, &ic->ic_ac) :
-		    ether_delmulti(ifr, &ic->ic_ac);
-		if (err == ENETRESET)
-			err = 0;
 		break;
 
 	default:
@@ -6973,7 +7088,6 @@ iwm_notif_intr(struct iwm_softc *sc)
 	while (sc->rxq.cur != hw) {
 		struct iwm_rx_data *data = &sc->rxq.data[sc->rxq.cur];
 		struct iwm_rx_packet *pkt;
-		struct iwm_cmd_response *cresp;
 		int qid, idx, code;
 
 		bus_dmamap_sync(sc->sc_dmat, data->map, 0, sizeof(*pkt),
@@ -7085,17 +7199,6 @@ iwm_notif_intr(struct iwm_softc *sc)
 			break;
 		}
 
-		case IWM_NVM_ACCESS_CMD:
-		case IWM_MCC_UPDATE_CMD:
-			if (sc->sc_wantresp == ((qid << 16) | idx)) {
-				bus_dmamap_sync(sc->sc_dmat, data->map, 0,
-				    sizeof(sc->sc_cmd_resp),
-				    BUS_DMASYNC_POSTREAD);
-				memcpy(sc->sc_cmd_resp,
-				    pkt, sizeof(sc->sc_cmd_resp));
-			}
-			break;
-
 		case IWM_MCC_CHUB_UPDATE_CMD: {
 			struct iwm_mcc_chub_notif *notif;
 			SYNC_RESP_STRUCT(notif, pkt);
@@ -7118,7 +7221,9 @@ iwm_notif_intr(struct iwm_softc *sc)
 		case IWM_BINDING_CONTEXT_CMD:
 		case IWM_WIDE_ID(IWM_ALWAYS_LONG_GROUP, IWM_SCAN_CFG_CMD):
 		case IWM_WIDE_ID(IWM_ALWAYS_LONG_GROUP, IWM_SCAN_REQ_UMAC):
+		case IWM_WIDE_ID(IWM_ALWAYS_LONG_GROUP, IWM_SCAN_ABORT_UMAC):
 		case IWM_SCAN_OFFLOAD_REQUEST_CMD:
+		case IWM_SCAN_OFFLOAD_ABORT_CMD:
 		case IWM_REPLY_BEACON_FILTERING_CMD:
 		case IWM_MAC_PM_POWER_TABLE:
 		case IWM_TIME_QUOTA_CMD:
@@ -7127,20 +7232,32 @@ iwm_notif_intr(struct iwm_softc *sc)
 		case IWM_LQ_CMD:
 		case IWM_BT_CONFIG:
 		case IWM_REPLY_THERMAL_MNG_BACKOFF:
-			SYNC_RESP_STRUCT(cresp, pkt);
-			if (sc->sc_wantresp == ((qid << 16) | idx)) {
-				memcpy(sc->sc_cmd_resp,
-				    pkt, sizeof(*pkt)+sizeof(*cresp));
-			}
-			break;
-
+		case IWM_NVM_ACCESS_CMD:
+		case IWM_MCC_UPDATE_CMD:
 		case IWM_TIME_EVENT_CMD: {
-			struct iwm_time_event_resp *resp;
-			if (sc->sc_wantresp == ((qid << 16) | idx)) {
-				SYNC_RESP_STRUCT(resp, pkt);
-				memcpy(sc->sc_cmd_resp,
-				    pkt, sizeof(*pkt) + sizeof(*resp));
+			size_t pkt_len;
+
+			if (sc->sc_cmd_resp_pkt[idx] == NULL)
+				break;
+
+			bus_dmamap_sync(sc->sc_dmat, data->map, 0,
+			    sizeof(*pkt), BUS_DMASYNC_POSTREAD);
+
+			pkt_len = sizeof(pkt->len_n_flags) +
+			    iwm_rx_packet_len(pkt);
+
+			if ((pkt->hdr.flags & IWM_CMD_FAILED_MSK) ||
+			    pkt_len < sizeof(*pkt) ||
+			    pkt_len > sc->sc_cmd_resp_len[idx]) {
+				free(sc->sc_cmd_resp_pkt[idx], M_DEVBUF,
+				    sc->sc_cmd_resp_len[idx]);
+				sc->sc_cmd_resp_pkt[idx] = NULL;
+				break;
 			}
+
+			bus_dmamap_sync(sc->sc_dmat, data->map, sizeof(*pkt),
+			    pkt_len - sizeof(*pkt), BUS_DMASYNC_POSTREAD);
+			memcpy(sc->sc_cmd_resp_pkt[idx], pkt, pkt_len);
 			break;
 		}
 
@@ -7549,8 +7666,6 @@ iwm_attach(struct device *parent, struct device *self, void *aux)
 	}
 	printf(", %s\n", intrstr);
 
-	sc->sc_wantresp = IWM_CMD_RESP_IDLE;
-
 	sc->sc_hw_rev = IWM_READ(sc, IWM_CSR_HW_REV);
 	switch (PCI_PRODUCT(pa->pa_id)) {
 	case PCI_PRODUCT_INTEL_WL_3160_1:
@@ -7774,6 +7889,7 @@ iwm_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->htprot_task, iwm_htprot_task, sc);
 
 	ic->ic_node_alloc = iwm_node_alloc;
+	ic->ic_bgscan_start = iwm_bgscan;
 
 	/* Override 802.11 state transition machine. */
 	sc->sc_newstate = ic->ic_newstate;

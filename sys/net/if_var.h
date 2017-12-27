@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_var.h,v 1.82 2017/10/12 09:14:16 mpi Exp $	*/
+/*	$OpenBSD: if_var.h,v 1.85 2017/12/15 01:37:30 dlg Exp $	*/
 /*	$NetBSD: if.h,v 1.23 1996/05/07 02:40:27 thorpej Exp $	*/
 
 /*
@@ -140,8 +140,6 @@ struct ifnet {				/* and the entries */
 	struct	task *if_linkstatetask; /* task to do route updates */
 
 	/* procedure handles */
-	struct mbuf_queue if_inputqueue;
-	struct task *if_inputtask;	/* input task */
 	SRPL_HEAD(, ifih) if_inputs;	/* input routines (dequeue) */
 
 					/* output routine (enqueue) */
@@ -163,6 +161,10 @@ struct ifnet {				/* and the entries */
 	struct	ifqueue **if_ifqs;	/* pointer to an array of sndqs */
 	void	(*if_qstart)(struct ifqueue *);
 	unsigned int if_nifqs;
+
+	struct	ifiqueue if_rcv;	/* rx/input queue */
+	struct	ifiqueue **if_iqs;	/* pointer to the array of iqs */
+	unsigned int if_niqs;
 
 	struct sockaddr_dl *if_sadl;	/* pointer to our sockaddr_dl */
 
@@ -298,13 +300,14 @@ int		niq_enlist(struct niqueue *, struct mbuf_list *);
     sysctl_mq((_n), (_l), (_op), (_olp), (_np), (_nl), &(_niq)->ni_q)
 
 extern struct ifnet_head ifnet;
-extern struct taskq *softnettq;
 
 void	if_start(struct ifnet *);
 int	if_enqueue_try(struct ifnet *, struct mbuf *);
 int	if_enqueue(struct ifnet *, struct mbuf *);
 void	if_input(struct ifnet *, struct mbuf_list *);
+void	if_input_process(struct ifnet *, struct mbuf_list *);
 int	if_input_local(struct ifnet *, struct mbuf *, sa_family_t);
+int	if_output_local(struct ifnet *, struct mbuf *, sa_family_t);
 void	if_rtrequest_dummy(struct ifnet *, int, struct rtentry *);
 void	p2p_rtrequest(struct ifnet *, int, struct rtentry *);
 
@@ -334,11 +337,13 @@ void	if_ih_insert(struct ifnet *, int (*)(struct ifnet *, struct mbuf *,
 void	if_ih_remove(struct ifnet *, int (*)(struct ifnet *, struct mbuf *,
 	    void *), void *);
 
+void	if_rxr_livelocked(struct if_rxring *);
 void	if_rxr_init(struct if_rxring *, u_int, u_int);
 u_int	if_rxr_get(struct if_rxring *, u_int);
 
 #define if_rxr_put(_r, _c)	do { (_r)->rxr_alive -= (_c); } while (0)
 #define if_rxr_inuse(_r)	((_r)->rxr_alive)
+#define if_rxr_cwm(_r)		((_r)->rxr_cwm)
 
 int	if_rxr_info_ioctl(struct if_rxrinfo *, u_int, struct if_rxring_info *);
 int	if_rxr_ioctl(struct if_rxrinfo *, const char *, u_int,

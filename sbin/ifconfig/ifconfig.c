@@ -1,4 +1,4 @@
-/*	$OpenBSD: ifconfig.c,v 1.348 2017/08/29 21:10:20 deraadt Exp $	*/
+/*	$OpenBSD: ifconfig.c,v 1.351 2017/11/17 18:04:51 benno Exp $	*/
 /*	$NetBSD: ifconfig.c,v 1.40 1997/10/01 02:19:43 enami Exp $	*/
 
 /*
@@ -424,12 +424,12 @@ const struct	cmd {
 	{ "maxupd",	NEXTARG,	0,		setpfsync_maxupd },
 	{ "defer",	1,		0,		setpfsync_defer },
 	{ "-defer",	0,		0,		setpfsync_defer },
-	/* giftunnel is for backward compat */
-	{ "giftunnel",  NEXTARG2,	0,		NULL, settunnel } ,
-	{ "tunnel",	NEXTARG2,	0,		NULL, settunnel } ,
-	{ "deletetunnel",  0,		0,		deletetunnel } ,
-	{ "tunneldomain", NEXTARG,	0,		settunnelinst } ,
-	{ "tunnelttl",	NEXTARG,	0,		settunnelttl } ,
+	{ "tunnel",	NEXTARG2,	0,		NULL, settunnel },
+	{ "-tunnel",	0,		0,		deletetunnel },
+	/* deletetunnel is for backward compat, remove during 6.4-current */
+	{ "deletetunnel",  0,		0,		deletetunnel },
+	{ "tunneldomain", NEXTARG,	0,		settunnelinst },
+	{ "tunnelttl",	NEXTARG,	0,		settunnelttl },
 	{ "pppoedev",	NEXTARG,	0,		setpppoe_dev },
 	{ "pppoesvc",	NEXTARG,	0,		setpppoe_svc },
 	{ "-pppoesvc",	1,		0,		setpppoe_svc },
@@ -2449,7 +2449,7 @@ process_media_commands(void)
 	ifr.ifr_media = media_current;
 
 	if (ioctl(s, SIOCSIFMEDIA, (caddr_t)&ifr) < 0)
-		;
+		err(1, "SIOCSIFMEDIA");
 }
 
 /* ARGSUSED */

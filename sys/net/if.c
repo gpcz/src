@@ -1,4 +1,4 @@
-/*	$OpenBSD: if.c,v 1.519 2017/10/16 13:40:58 mpi Exp $	*/
+/*	$OpenBSD: if.c,v 1.531 2017/12/15 01:37:30 dlg Exp $	*/
 /*	$NetBSD: if.c,v 1.35 1996/05/07 05:26:04 thorpej Exp $	*/
 
 /*
@@ -138,6 +138,9 @@ void	if_slowtimo(void *);
 void	if_detached_qstart(struct ifqueue *);
 int	if_detached_ioctl(struct ifnet *, u_long, caddr_t);
 
+int	ifioctl_get(u_long, caddr_t);
+int	ifconf(caddr_t);
+
 int	if_getgroup(caddr_t, struct ifnet *);
 int	if_getgroupmembers(caddr_t);
 int	if_getgroupattribs(caddr_t);
@@ -153,7 +156,6 @@ int	if_group_egress_build(void);
 
 void	if_watchdog_task(void *);
 
-void	if_input_process(void *);
 void	if_netisr(void *);
 
 #ifdef DDB
@@ -224,7 +226,9 @@ int	net_livelocked(void);
 int	ifq_congestion;
 
 int		 netisr;
-struct taskq	*softnettq;
+
+#define	NET_TASKQ	1
+struct taskq	*nettqmp[NET_TASKQ];
 
 struct task if_input_task_locked = TASK_INITIALIZER(if_netisr, NULL);
 
@@ -240,6 +244,8 @@ struct rwlock netlock = RWLOCK_INITIALIZER("netlock");
 void
 ifinit(void)
 {
+	unsigned int	i;
+
 	/*
 	 * most machines boot with 4 or 5 interfaces, so size the initial map
 	 * to accomodate this
@@ -248,9 +254,11 @@ ifinit(void)
 
 	timeout_set(&net_tick_to, net_tick, &net_tick_to);
 
-	softnettq = taskq_create("softnet", 1, IPL_NET, TASKQ_MPSAFE);
-	if (softnettq == NULL)
-		panic("unable to create softnet taskq");
+	for (i = 0; i < NET_TASKQ; i++) {
+		nettqmp[i] = taskq_create("softnet", 1, IPL_NET, TASKQ_MPSAFE);
+		if (nettqmp[i] == NULL)
+			panic("unable to create network taskq %d", i);
+	}
 
 	net_tick(&net_tick_to);
 }
@@ -428,8 +436,6 @@ if_attachsetup(struct ifnet *ifp)
 
 	ifidx = ifp->if_index;
 
-	mq_init(&ifp->if_inputqueue, 8192, IPL_NET);
-	task_set(ifp->if_inputtask, if_input_process, (void *)ifidx);
 	task_set(ifp->if_watchdogtask, if_watchdog_task, (void *)ifidx);
 	task_set(ifp->if_linkstatetask, if_linkstate_task, (void *)ifidx);
 
@@ -554,6 +560,30 @@ if_attach_queues(struct ifnet *ifp, unsigned int nqs)
 }
 
 void
+if_attach_iqueues(struct ifnet *ifp, unsigned int niqs)
+{
+	struct ifiqueue **map;
+	struct ifiqueue *ifiq;
+	unsigned int i;
+
+	KASSERT(niqs != 0);
+
+	map = mallocarray(niqs, sizeof(*map), M_DEVBUF, M_WAITOK);
+
+	ifp->if_rcv.ifiq_softc = NULL;
+	map[0] = &ifp->if_rcv;
+
+	for (i = 1; i < niqs; i++) {
+		ifiq = malloc(sizeof(*ifiq), M_DEVBUF, M_WAITOK|M_ZERO);
+		ifiq_init(ifiq, ifp, i);
+		map[i] = ifiq;
+	}
+
+	ifp->if_iqs = map;
+	ifp->if_niqs = niqs;
+}
+
+void
 if_attach_common(struct ifnet *ifp)
 {
 	KASSERT(ifp->if_ioctl != NULL);
@@ -578,6 +608,12 @@ if_attach_common(struct ifnet *ifp)
 	ifp->if_ifqs = ifp->if_snd.ifq_ifqs;
 	ifp->if_nifqs = 1;
 
+	ifiq_init(&ifp->if_rcv, ifp, 0);
+
+	ifp->if_rcv.ifiq_ifiqs[0] = &ifp->if_rcv;
+	ifp->if_iqs = ifp->if_rcv.ifiq_ifiqs;
+	ifp->if_niqs = 1;
+
 	ifp->if_addrhooks = malloc(sizeof(*ifp->if_addrhooks),
 	    M_TEMP, M_WAITOK);
 	TAILQ_INIT(ifp->if_addrhooks);
@@ -595,8 +631,6 @@ if_attach_common(struct ifnet *ifp)
 	ifp->if_watchdogtask = malloc(sizeof(*ifp->if_watchdogtask),
 	    M_TEMP, M_WAITOK|M_ZERO);
 	ifp->if_linkstatetask = malloc(sizeof(*ifp->if_linkstatetask),
-	    M_TEMP, M_WAITOK|M_ZERO);
-	ifp->if_inputtask = malloc(sizeof(*ifp->if_inputtask),
 	    M_TEMP, M_WAITOK|M_ZERO);
 	ifp->if_llprio = IFQ_DEFPRIO;
 
@@ -685,47 +719,7 @@ if_enqueue(struct ifnet *ifp, struct mbuf *m)
 void
 if_input(struct ifnet *ifp, struct mbuf_list *ml)
 {
-	struct mbuf *m;
-	size_t ibytes = 0;
-#if NBPFILTER > 0
-	caddr_t if_bpf;
-#endif
-
-	if (ml_empty(ml))
-		return;
-
-	MBUF_LIST_FOREACH(ml, m) {
-		m->m_pkthdr.ph_ifidx = ifp->if_index;
-		m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
-		ibytes += m->m_pkthdr.len;
-	}
-
-	ifp->if_ipackets += ml_len(ml);
-	ifp->if_ibytes += ibytes;
-
-#if NBPFILTER > 0
-	if_bpf = ifp->if_bpf;
-	if (if_bpf) {
-		struct mbuf_list ml0;
-
-		ml_init(&ml0);
-		ml_enlist(&ml0, ml);
-		ml_init(ml);
-
-		while ((m = ml_dequeue(&ml0)) != NULL) {
-			if (bpf_mtap_ether(if_bpf, m, BPF_DIRECTION_IN))
-				m_freem(m);
-			else
-				ml_enqueue(ml, m);
-		}
-
-		if (ml_empty(ml))
-			return;
-	}
-#endif
-
-	if (mq_enlist(&ifp->if_inputqueue, ml) == 0)
-		task_add(softnettq, ifp->if_inputtask);
+	ifiq_input(&ifp->if_rcv, ml, 2048);
 }
 
 int
@@ -778,6 +772,24 @@ if_input_local(struct ifnet *ifp, struct mbuf *m, sa_family_t af)
 	}
 
 	return (0);
+}
+
+int
+if_output_local(struct ifnet *ifp, struct mbuf *m, sa_family_t af)
+{
+	struct ifiqueue *ifiq;
+	unsigned int flow = 0;
+
+	m->m_pkthdr.ph_family = af;
+	m->m_pkthdr.ph_ifidx = ifp->if_index;
+	m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
+
+	if (ISSET(m->m_pkthdr.ph_flowid, M_FLOWID_VALID))
+		flow = m->m_pkthdr.ph_flowid & M_FLOWID_MASK;
+
+	ifiq = ifp->if_iqs[flow % ifp->if_niqs];
+
+	return (ifiq_enqueue(ifiq, m) == 0 ? 0 : ENOBUFS);
 }
 
 struct ifih {
@@ -864,29 +876,18 @@ if_ih_remove(struct ifnet *ifp, int (*input)(struct ifnet *, struct mbuf *,
 }
 
 void
-if_input_process(void *xifidx)
+if_input_process(struct ifnet *ifp, struct mbuf_list *ml)
 {
-	unsigned int ifidx = (unsigned long)xifidx;
-	struct mbuf_list ml;
 	struct mbuf *m;
-	struct ifnet *ifp;
 	struct ifih *ifih;
 	struct srp_ref sr;
 	int s;
-#ifdef IPSEC
-	int locked = 0;
-#endif /* IPSEC */
 
-	ifp = if_get(ifidx);
-	if (ifp == NULL)
+	if (ml_empty(ml))
 		return;
 
-	mq_delist(&ifp->if_inputqueue, &ml);
-	if (ml_empty(&ml))
-		goto out;
-
 	if (!ISSET(ifp->if_xflags, IFXF_CLONED))
-		add_net_randomness(ml_len(&ml));
+		add_net_randomness(ml_len(ml));
 
 	/*
 	 * We grab the NET_LOCK() before processing any packet to
@@ -900,25 +901,9 @@ if_input_process(void *xifidx)
 	 * to PF globals, pipex globals, unicast and multicast addresses
 	 * lists.
 	 */
-	NET_LOCK();
+	NET_RLOCK();
 	s = splnet();
-
-#ifdef IPSEC
-	/*
-	 * IPsec is not ready to run without KERNEL_LOCK().  So all
-	 * the traffic on your machine is punished if you have IPsec
-	 * enabled.
-	 */
-	extern int ipsec_in_use;
-	if (ipsec_in_use) {
-		NET_UNLOCK();
-		KERNEL_LOCK();
-		NET_LOCK();
-		locked = 1;
-	}
-#endif /* IPSEC */
-
-	while ((m = ml_dequeue(&ml)) != NULL) {
+	while ((m = ml_dequeue(ml)) != NULL) {
 		/*
 		 * Pass this mbuf to all input handlers of its
 		 * interface until it is consumed.
@@ -933,14 +918,7 @@ if_input_process(void *xifidx)
 			m_freem(m);
 	}
 	splx(s);
-	NET_UNLOCK();
-
-#ifdef IPSEC
-	if (locked)
-		KERNEL_UNLOCK();
-#endif /* IPSEC */
-out:
-	if_put(ifp);
+	NET_RUNLOCK();
 }
 
 void
@@ -1048,16 +1026,12 @@ if_detach(struct ifnet *ifp)
 	ifp->if_ioctl = if_detached_ioctl;
 	ifp->if_watchdog = NULL;
 
-	/* Remove the input task */
-	task_del(softnettq, ifp->if_inputtask);
-	mq_purge(&ifp->if_inputqueue);
-
 	/* Remove the watchdog timeout & task */
 	timeout_del(ifp->if_slowtimo);
-	task_del(softnettq, ifp->if_watchdogtask);
+	task_del(net_tq(ifp->if_index), ifp->if_watchdogtask);
 
 	/* Remove the link state task */
-	task_del(softnettq, ifp->if_linkstatetask);
+	task_del(net_tq(ifp->if_index), ifp->if_linkstatetask);
 
 #if NBPFILTER > 0
 	bpfdetach(ifp);
@@ -1105,7 +1079,6 @@ if_detach(struct ifnet *ifp)
 	free(ifp->if_slowtimo, M_TEMP, sizeof(*ifp->if_slowtimo));
 	free(ifp->if_watchdogtask, M_TEMP, sizeof(*ifp->if_watchdogtask));
 	free(ifp->if_linkstatetask, M_TEMP, sizeof(*ifp->if_linkstatetask));
-	free(ifp->if_inputtask, M_TEMP, sizeof(*ifp->if_inputtask));
 
 	for (i = 0; (dp = domains[i]) != NULL; i++) {
 		if (dp->dom_ifdetach && ifp->if_afdata[dp->dom_family])
@@ -1127,6 +1100,17 @@ if_detach(struct ifnet *ifp)
 		}
 		free(ifp->if_ifqs, M_DEVBUF,
 		    sizeof(struct ifqueue *) * ifp->if_nifqs);
+	}
+
+	for (i = 0; i < ifp->if_niqs; i++)
+		ifiq_destroy(ifp->if_iqs[i]);
+	if (ifp->if_iqs != ifp->if_rcv.ifiq_ifiqs) {
+		for (i = 1; i < ifp->if_niqs; i++) {
+			free(ifp->if_iqs[i], M_DEVBUF,
+			    sizeof(struct ifiqueue));
+		}
+		free(ifp->if_iqs, M_DEVBUF,
+		    sizeof(struct ifiqueue *) * ifp->if_niqs);
 	}
 }
 
@@ -1607,7 +1591,7 @@ if_linkstate(struct ifnet *ifp)
 void
 if_link_state_change(struct ifnet *ifp)
 {
-	task_add(softnettq, ifp->if_linkstatetask);
+	task_add(net_tq(ifp->if_index), ifp->if_linkstatetask);
 }
 
 /*
@@ -1623,7 +1607,7 @@ if_slowtimo(void *arg)
 
 	if (ifp->if_watchdog) {
 		if (ifp->if_timer > 0 && --ifp->if_timer == 0)
-			task_add(softnettq, ifp->if_watchdogtask);
+			task_add(net_tq(ifp->if_index), ifp->if_watchdogtask);
 		timeout_add(ifp->if_slowtimo, hz / IFNET_SLOWHZ);
 	}
 	splx(s);
@@ -1822,28 +1806,46 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 	int s, error = 0, oif_xflags;
 	size_t bytesdone;
 	unsigned short oif_flags;
-	const char *label;
 
 	switch (cmd) {
-	case SIOCGIFCONF:
-		return (ifconf(cmd, data));
 	case SIOCIFCREATE:
+		if ((error = suser(p, 0)) != 0)
+			return (error);
+		NET_LOCK();
+		error = if_clone_create(ifr->ifr_name, 0);
+		NET_UNLOCK();
+		return (error);
 	case SIOCIFDESTROY:
 		if ((error = suser(p, 0)) != 0)
 			return (error);
-		return ((cmd == SIOCIFCREATE) ?
-		    if_clone_create(ifr->ifr_name, 0) :
-		    if_clone_destroy(ifr->ifr_name));
-	case SIOCIFGCLONERS:
-		return (if_clone_list((struct if_clonereq *)data));
-	case SIOCGIFGMEMB:
-		return (if_getgroupmembers(data));
-	case SIOCGIFGATTR:
-		return (if_getgroupattribs(data));
+		NET_LOCK();
+		error = if_clone_destroy(ifr->ifr_name);
+		NET_UNLOCK();
+		return (error);
 	case SIOCSIFGATTR:
 		if ((error = suser(p, 0)) != 0)
 			return (error);
-		return (if_setgroupattribs(data));
+		NET_LOCK();
+		error = if_setgroupattribs(data);
+		NET_UNLOCK();
+		return (error);
+	case SIOCGIFCONF:
+	case SIOCIFGCLONERS:
+	case SIOCGIFGMEMB:
+	case SIOCGIFGATTR:
+	case SIOCGIFFLAGS:
+	case SIOCGIFXFLAGS:
+	case SIOCGIFMETRIC:
+	case SIOCGIFMTU:
+	case SIOCGIFHARDMTU:
+	case SIOCGIFDATA:
+	case SIOCGIFDESCR:
+	case SIOCGIFRTLABEL:
+	case SIOCGIFPRIORITY:
+	case SIOCGIFRDOMAIN:
+	case SIOCGIFGROUP:
+	case SIOCGIFLLPRIO:
+		return (ifioctl_get(cmd, data));
 	}
 
 	ifp = ifunit(ifr->ifr_name);
@@ -1851,6 +1853,8 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		return (ENXIO);
 	oif_flags = ifp->if_flags;
 	oif_xflags = ifp->if_xflags;
+
+	NET_LOCK();
 
 	switch (cmd) {
 	case SIOCIFAFATTACH:
@@ -1875,35 +1879,6 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 			error = EAFNOSUPPORT;
 		}
 		break;
-
-	case SIOCGIFFLAGS:
-		ifr->ifr_flags = ifp->if_flags;
-		if (ifq_is_oactive(&ifp->if_snd))
-			ifr->ifr_flags |= IFF_OACTIVE;
-		break;
-
-	case SIOCGIFXFLAGS:
-		ifr->ifr_flags = ifp->if_xflags & ~(IFXF_MPSAFE|IFXF_CLONED);
-		break;
-
-	case SIOCGIFMETRIC:
-		ifr->ifr_metric = ifp->if_metric;
-		break;
-
-	case SIOCGIFMTU:
-		ifr->ifr_mtu = ifp->if_mtu;
-		break;
-
-	case SIOCGIFHARDMTU:
-		ifr->ifr_hardmtu = ifp->if_hardmtu;
-		break;
-
-	case SIOCGIFDATA: {
-		struct if_data ifdata;
-		if_getdata(ifp, &ifdata);
-		error = copyout(&ifdata, ifr->ifr_data, sizeof(ifdata));
-		break;
-	}
 
 	case SIOCSIFFLAGS:
 		if ((error = suser(p, 0)) != 0)
@@ -2003,36 +1978,6 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 			rtm_ifchg(ifp);
 		break;
 
-	case SIOCDIFPHYADDR:
-	case SIOCSLIFPHYADDR:
-	case SIOCSLIFPHYRTABLE:
-	case SIOCSLIFPHYTTL:
-	case SIOCADDMULTI:
-	case SIOCDELMULTI:
-	case SIOCSIFMEDIA:
-	case SIOCSVNETID:
-	case SIOCSIFPAIR:
-	case SIOCSIFPARENT:
-	case SIOCDIFPARENT:
-		if ((error = suser(p, 0)) != 0)
-			break;
-		/* FALLTHROUGH */
-	case SIOCGLIFPHYADDR:
-	case SIOCGLIFPHYRTABLE:
-	case SIOCGLIFPHYTTL:
-	case SIOCGIFMEDIA:
-	case SIOCGVNETID:
-	case SIOCGIFPAIR:
-	case SIOCGIFPARENT:
-		error = (*ifp->if_ioctl)(ifp, cmd, data);
-		break;
-
-	case SIOCGIFDESCR:
-		strlcpy(ifdescrbuf, ifp->if_description, IFDESCRSIZE);
-		error = copyoutstr(ifdescrbuf, ifr->ifr_data, IFDESCRSIZE,
-		    &bytesdone);
-		break;
-
 	case SIOCSIFDESCR:
 		if ((error = suser(p, 0)) != 0)
 			break;
@@ -2042,16 +1987,6 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 			(void)memset(ifp->if_description, 0, IFDESCRSIZE);
 			strlcpy(ifp->if_description, ifdescrbuf, IFDESCRSIZE);
 		}
-		break;
-
-	case SIOCGIFRTLABEL:
-		if (ifp->if_rtlabelid &&
-		    (label = rtlabel_id2name(ifp->if_rtlabelid)) != NULL) {
-			strlcpy(ifrtlabelbuf, label, RTLABEL_LEN);
-			error = copyoutstr(ifrtlabelbuf, ifr->ifr_data,
-			    RTLABEL_LEN, &bytesdone);
-		} else
-			error = ENOENT;
 		break;
 
 	case SIOCSIFRTLABEL:
@@ -2065,10 +2000,6 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		}
 		break;
 
-	case SIOCGIFPRIORITY:
-		ifr->ifr_metric = ifp->if_priority;
-		break;
-
 	case SIOCSIFPRIORITY:
 		if ((error = suser(p, 0)) != 0)
 			break;
@@ -2077,10 +2008,6 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 			break;
 		}
 		ifp->if_priority = ifr->ifr_metric;
-		break;
-
-	case SIOCGIFRDOMAIN:
-		ifr->ifr_rdomainid = ifp->if_rdomain;
 		break;
 
 	case SIOCSIFRDOMAIN:
@@ -2097,10 +2024,6 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		error = (*ifp->if_ioctl)(ifp, cmd, data);
 		if (error == ENOTTY)
 			error = 0;
-		break;
-
-	case SIOCGIFGROUP:
-		error = if_getgroup(data, ifp);
 		break;
 
 	case SIOCDIFGROUP:
@@ -2142,10 +2065,6 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 			ifnewlladdr(ifp);
 		break;
 
-	case SIOCGIFLLPRIO:
-		ifr->ifr_llprio = ifp->if_llprio;
-		break;
-
 	case SIOCSIFLLPRIO:
 		if ((error = suser(p, 0)))
 			break;
@@ -2156,10 +2075,26 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		ifp->if_llprio = ifr->ifr_llprio;
 		break;
 
+	case SIOCDIFPHYADDR:
+	case SIOCSLIFPHYADDR:
+	case SIOCSLIFPHYRTABLE:
+	case SIOCSLIFPHYTTL:
+	case SIOCADDMULTI:
+	case SIOCDELMULTI:
+	case SIOCSIFMEDIA:
+	case SIOCSVNETID:
+	case SIOCSIFPAIR:
+	case SIOCSIFPARENT:
+	case SIOCDIFPARENT:
+		if ((error = suser(p, 0)) != 0)
+			break;
+		/* FALLTHROUGH */
 	default:
 		error = ((*so->so_proto->pr_usrreq)(so, PRU_CONTROL,
 			(struct mbuf *) cmd, (struct mbuf *) data,
 			(struct mbuf *) ifp, p));
+		if (error == EOPNOTSUPP)
+			error = ((*ifp->if_ioctl)(ifp, cmd, data));
 		break;
 	}
 
@@ -2168,6 +2103,119 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 
 	if (((oif_flags ^ ifp->if_flags) & IFF_UP) != 0)
 		getmicrotime(&ifp->if_lastchange);
+
+	NET_UNLOCK();
+
+	return (error);
+}
+
+int
+ifioctl_get(u_long cmd, caddr_t data)
+{
+	struct ifnet *ifp;
+	struct ifreq *ifr = (struct ifreq *)data;
+	char ifdescrbuf[IFDESCRSIZE];
+	char ifrtlabelbuf[RTLABEL_LEN];
+	int error = 0;
+	size_t bytesdone;
+	const char *label;
+
+	switch(cmd) {
+	case SIOCGIFCONF:
+		NET_RLOCK();
+		error = ifconf(data);
+		NET_RUNLOCK();
+		return (error);
+	case SIOCIFGCLONERS:
+		NET_RLOCK();
+		error = if_clone_list((struct if_clonereq *)data);
+		NET_RUNLOCK();
+		return (error);
+	case SIOCGIFGMEMB:
+		NET_RLOCK();
+		error = if_getgroupmembers(data);
+		NET_RUNLOCK();
+		return (error);
+	case SIOCGIFGATTR:
+		NET_RLOCK();
+		error = if_getgroupattribs(data);
+		NET_RUNLOCK();
+		return (error);
+	}
+
+	ifp = ifunit(ifr->ifr_name);
+	if (ifp == NULL)
+		return (ENXIO);
+
+	NET_RLOCK();
+
+	switch(cmd) {
+	case SIOCGIFFLAGS:
+		ifr->ifr_flags = ifp->if_flags;
+		if (ifq_is_oactive(&ifp->if_snd))
+			ifr->ifr_flags |= IFF_OACTIVE;
+		break;
+
+	case SIOCGIFXFLAGS:
+		ifr->ifr_flags = ifp->if_xflags & ~(IFXF_MPSAFE|IFXF_CLONED);
+		break;
+
+	case SIOCGIFMETRIC:
+		ifr->ifr_metric = ifp->if_metric;
+		break;
+
+	case SIOCGIFMTU:
+		ifr->ifr_mtu = ifp->if_mtu;
+		break;
+
+	case SIOCGIFHARDMTU:
+		ifr->ifr_hardmtu = ifp->if_hardmtu;
+		break;
+
+	case SIOCGIFDATA: {
+		struct if_data ifdata;
+		if_getdata(ifp, &ifdata);
+		error = copyout(&ifdata, ifr->ifr_data, sizeof(ifdata));
+		break;
+	}
+
+	case SIOCGIFDESCR:
+		strlcpy(ifdescrbuf, ifp->if_description, IFDESCRSIZE);
+		error = copyoutstr(ifdescrbuf, ifr->ifr_data, IFDESCRSIZE,
+		    &bytesdone);
+		break;
+
+	case SIOCGIFRTLABEL:
+		if (ifp->if_rtlabelid &&
+		    (label = rtlabel_id2name(ifp->if_rtlabelid)) != NULL) {
+			strlcpy(ifrtlabelbuf, label, RTLABEL_LEN);
+			error = copyoutstr(ifrtlabelbuf, ifr->ifr_data,
+			    RTLABEL_LEN, &bytesdone);
+		} else
+			error = ENOENT;
+		break;
+
+	case SIOCGIFPRIORITY:
+		ifr->ifr_metric = ifp->if_priority;
+		break;
+
+	case SIOCGIFRDOMAIN:
+		ifr->ifr_rdomainid = ifp->if_rdomain;
+		break;
+
+	case SIOCGIFGROUP:
+		error = if_getgroup(data, ifp);
+		break;
+
+	case SIOCGIFLLPRIO:
+		ifr->ifr_llprio = ifp->if_llprio;
+		break;
+
+	default:
+		panic("invalid ioctl %lu", cmd);
+	}
+
+	NET_RUNLOCK();
 
 	return (error);
 }
@@ -2179,7 +2227,7 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
  * other information.
  */
 int
-ifconf(u_long cmd, caddr_t data)
+ifconf(caddr_t data)
 {
 	struct ifconf *ifc = (struct ifconf *)data;
 	struct ifnet *ifp;
@@ -2258,30 +2306,20 @@ void
 if_getdata(struct ifnet *ifp, struct if_data *data)
 {
 	unsigned int i;
-	struct ifqueue *ifq;
-	uint64_t opackets = 0;
-	uint64_t obytes = 0;
-	uint64_t omcasts = 0;
-	uint64_t oqdrops = 0;
-
-	for (i = 0; i < ifp->if_nifqs; i++) {
-		ifq = ifp->if_ifqs[i];
-
-		mtx_enter(&ifq->ifq_mtx);
-		opackets += ifq->ifq_packets;
-		obytes += ifq->ifq_bytes;
-		oqdrops += ifq->ifq_qdrops;
-		omcasts += ifq->ifq_mcasts;
-		mtx_leave(&ifq->ifq_mtx);
-		/* ifq->ifq_errors */
-	}
 
 	*data = ifp->if_data;
-	data->ifi_opackets += opackets;
-	data->ifi_obytes += obytes;
-	data->ifi_oqdrops += oqdrops;
-	data->ifi_omcasts += omcasts;
-	/* ifp->if_data.ifi_oerrors */
+
+	for (i = 0; i < ifp->if_nifqs; i++) {
+		struct ifqueue *ifq = ifp->if_ifqs[i];
+
+		ifq_add_data(ifq, data);
+	}
+
+	for (i = 0; i < ifp->if_niqs; i++) {
+		struct ifiqueue *ifiq = ifp->if_iqs[i];
+
+		ifiq_add_data(ifiq, data);
+	}
 }
 
 /*
@@ -2620,14 +2658,12 @@ int
 ifpromisc(struct ifnet *ifp, int pswitch)
 {
 	struct ifreq ifr;
+	unsigned short oif_flags;
+	int oif_pcount, error;
 
+	oif_flags = ifp->if_flags;
+	oif_pcount = ifp->if_pcount;
 	if (pswitch) {
-		/*
-		 * If the device is not configured up, we cannot put it in
-		 * promiscuous mode.
-		 */
-		if ((ifp->if_flags & IFF_UP) == 0)
-			return (ENETDOWN);
 		if (ifp->if_pcount++ != 0)
 			return (0);
 		ifp->if_flags |= IFF_PROMISC;
@@ -2635,17 +2671,20 @@ ifpromisc(struct ifnet *ifp, int pswitch)
 		if (--ifp->if_pcount > 0)
 			return (0);
 		ifp->if_flags &= ~IFF_PROMISC;
-		/*
-		 * If the device is not configured up, we should not need to
-		 * turn off promiscuous mode (device should have turned it
-		 * off when interface went down; and will look at IFF_PROMISC
-		 * again next time interface comes up).
-		 */
-		if ((ifp->if_flags & IFF_UP) == 0)
-			return (0);
 	}
+
+	if ((ifp->if_flags & IFF_UP) == 0)
+		return (0);
+
+	memset(&ifr, 0, sizeof(ifr));
 	ifr.ifr_flags = ifp->if_flags;
-	return ((*ifp->if_ioctl)(ifp, SIOCSIFFLAGS, (caddr_t)&ifr));
+	error = ((*ifp->if_ioctl)(ifp, SIOCSIFFLAGS, (caddr_t)&ifr));
+	if (error) {
+		ifp->if_flags = oif_flags;
+		ifp->if_pcount = oif_pcount;
+	}
+
+	return (error);
 }
 
 void
@@ -2801,6 +2840,19 @@ if_rxr_adjust_cwm(struct if_rxring *rxr)
 	rxr->rxr_adjusted = ticks;
 }
 
+void
+if_rxr_livelocked(struct if_rxring *rxr)
+{
+	extern int ticks;
+
+	if (ticks - rxr->rxr_adjusted >= 1) {
+		if (rxr->rxr_cwm > rxr->rxr_lwm)
+			rxr->rxr_cwm--;
+
+		rxr->rxr_adjusted = ticks;
+	}
+}
+
 u_int
 if_rxr_get(struct if_rxring *rxr, u_int max)
 {
@@ -2904,4 +2956,21 @@ __dead void
 unhandled_af(int af)
 {
 	panic("unhandled af %d", af);
+}
+
+/*
+ * XXXSMP This tunable is here to work around the fact that IPsec
+ * globals aren't ready to be accessed by multiple threads in
+ * parallel.
+ */
+int		 nettaskqs = NET_TASKQ;
+
+struct taskq *
+net_tq(unsigned int ifindex)
+{
+	struct taskq *t = NULL;
+
+	t = nettqmp[ifindex % nettaskqs];
+
+	return (t);
 }

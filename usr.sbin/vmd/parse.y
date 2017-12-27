@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.29 2017/05/04 08:26:06 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.31 2017/11/11 02:50:07 mlarkin Exp $	*/
 
 /*
  * Copyright (c) 2007-2016 Reyk Floeter <reyk@openbsd.org>
@@ -88,9 +88,7 @@ int		 parse_disk(char *);
 static struct vmop_create_params vmc;
 static struct vm_create_params	*vcp;
 static struct vmd_switch	*vsw;
-static struct vmd_if		*vif;
 static struct vmd_vm		*vm;
-static unsigned int		 vsw_unit;
 static char			 vsw_type[IF_NAMESIZE];
 static int			 vcp_disable;
 static size_t			 vcp_nnics;
@@ -194,12 +192,16 @@ switch		: SWITCH string			{
 			vsw->sw_id = env->vmd_nswitches + 1;
 			vsw->sw_name = $2;
 			vsw->sw_flags = VMIFF_UP;
-			snprintf(vsw->sw_ifname, sizeof(vsw->sw_ifname),
-			    "%s%u", vsw_type, vsw_unit++);
-			TAILQ_INIT(&vsw->sw_ifs);
 
 			vcp_disable = 0;
 		} '{' optnl switch_opts_l '}'	{
+			if (strnlen(vsw->sw_ifname,
+			    sizeof(vsw->sw_ifname)) == 0) {
+				yyerror("switch \"%s\" is missing interface name",
+				    vsw->sw_name);
+				YYERROR;
+			}
+
 			if (vcp_disable) {
 				log_debug("%s:%d: switch \"%s\""
 				    " skipped (disabled)",
@@ -220,21 +222,6 @@ switch_opts_l	: switch_opts_l switch_opts nl
 switch_opts	: disable			{
 			vcp_disable = $1;
 		}
-		| ADD string			{
-			char		type[IF_NAMESIZE];
-
-			if ((vif = calloc(1, sizeof(*vif))) == NULL)
-				fatal("could not allocate interface");
-
-			if (priv_getiftype($2, type, NULL) == -1) {
-				yyerror("invalid interface: %s", $2);
-				free($2);
-				YYERROR;
-			}
-			vif->vif_name = $2;
-
-			TAILQ_INSERT_TAIL(&vsw->sw_ifs, vif, vif_entry);
-		}
 		| GROUP string			{
 			if (priv_validgroup($2) == -1) {
 				yyerror("invalid group name: %s", $2);
@@ -244,13 +231,12 @@ switch_opts	: disable			{
 			vsw->sw_group = $2;
 		}
 		| INTERFACE string		{
-			if (priv_getiftype($2, vsw_type, &vsw_unit) == -1 ||
+			if (priv_getiftype($2, vsw_type, NULL) == -1 ||
 			    priv_findname(vsw_type, vmd_descsw) == -1) {
 				yyerror("invalid switch interface: %s", $2);
 				free($2);
 				YYERROR;
 			}
-			vsw_unit++;
 
 			if (strlcpy(vsw->sw_ifname, $2,
 			    sizeof(vsw->sw_ifname)) >= sizeof(vsw->sw_ifname)) {

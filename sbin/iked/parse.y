@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.65 2017/04/24 07:07:25 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.68 2017/12/01 20:19:05 patrick Exp $	*/
 
 /*
  * Copyright (c) 2010-2013 Reyk Floeter <reyk@openbsd.org>
@@ -99,6 +99,7 @@ static int		 debug = 0;
 static int		 rules = 0;
 static int		 passive = 0;
 static int		 decouple = 0;
+static int		 mobike = 1;
 static char		*ocsp_url = NULL;
 
 struct ipsec_xf {
@@ -384,7 +385,7 @@ typedef struct {
 %token	PASSIVE ACTIVE ANY TAG TAP PROTO LOCAL GROUP NAME CONFIG EAP USER
 %token	IKEV1 FLOW SA TCPMD5 TUNNEL TRANSPORT COUPLE DECOUPLE SET
 %token	INCLUDE LIFETIME BYTES INET INET6 QUICK SKIP DEFAULT
-%token	IPCOMP OCSP IKELIFETIME
+%token	IPCOMP OCSP IKELIFETIME MOBIKE NOMOBIKE
 %token	<v.string>		STRING
 %token	<v.number>		NUMBER
 %type	<v.string>		string
@@ -445,6 +446,8 @@ set		: SET ACTIVE	{ passive = 0; }
 		| SET PASSIVE	{ passive = 1; }
 		| SET COUPLE	{ decouple = 0; }
 		| SET DECOUPLE	{ decouple = 1; }
+		| SET MOBIKE	{ mobike = 1; }
+		| SET NOMOBIKE	{ mobike = 0; }
 		| SET OCSP STRING		{
 			if ((ocsp_url = strdup($3)) == NULL) {
 				yyerror("cannot set ocsp_url");
@@ -1126,7 +1129,9 @@ lookup(char *s)
 		{ "ipcomp",		IPCOMP },
 		{ "lifetime",		LIFETIME },
 		{ "local",		LOCAL },
+		{ "mobike",		MOBIKE },
 		{ "name",		NAME },
+		{ "nomobike",		NOMOBIKE },
 		{ "ocsp",		OCSP },
 		{ "passive",		PASSIVE },
 		{ "peer",		PEER },
@@ -1494,7 +1499,11 @@ parse_config(const char *filename, struct iked *x_env)
 	if ((file = pushfile(filename, 1)) == NULL)
 		return (-1);
 
+	free(ocsp_url);
+
+	mobike = 1;
 	decouple = passive = 0;
+	ocsp_url = NULL;
 
 	if (env->sc_opts & IKED_OPT_PASSIVE)
 		passive = 1;
@@ -1505,6 +1514,7 @@ parse_config(const char *filename, struct iked *x_env)
 
 	env->sc_passive = passive ? 1 : 0;
 	env->sc_decoupled = decouple ? 1 : 0;
+	env->sc_mobike = mobike;
 	env->sc_ocsp_url = ocsp_url;
 
 	if (!rules)
@@ -2579,6 +2589,7 @@ create_ike(char *name, int af, uint8_t ipproto, struct ipsec_hosts *hosts,
 	struct iked_policy	 pol;
 	struct iked_proposal	 prop[2];
 	unsigned int		 j;
+	unsigned int		 ikepropid = 1, ipsecpropid = 1;
 	struct iked_transform	 ikexforms[64], ipsecxforms[64];
 	struct iked_flow	 flows[64];
 	static unsigned int	 policy_id = 0;
@@ -2709,7 +2720,7 @@ create_ike(char *name, int af, uint8_t ipproto, struct ipsec_hosts *hosts,
 	TAILQ_INIT(&pol.pol_proposals);
 	RB_INIT(&pol.pol_flows);
 
-	prop[0].prop_id = ++pol.pol_nproposals;
+	prop[0].prop_id = ikepropid++;
 	prop[0].prop_protoid = IKEV2_SAPROTO_IKE;
 	if (ike_sa == NULL || ike_sa->xfs == NULL) {
 		prop[0].prop_nxforms = ikev2_default_nike_transforms;
@@ -2740,8 +2751,9 @@ create_ike(char *name, int af, uint8_t ipproto, struct ipsec_hosts *hosts,
 		prop[0].prop_xforms = ikexforms;
 	}
 	TAILQ_INSERT_TAIL(&pol.pol_proposals, &prop[0], prop_entry);
+	pol.pol_nproposals++;
 
-	prop[1].prop_id = ++pol.pol_nproposals;
+	prop[1].prop_id = ipsecpropid++;
 	prop[1].prop_protoid = saproto;
 	if (ipsec_sa == NULL || ipsec_sa->xfs == NULL) {
 		prop[1].prop_nxforms = ikev2_default_nesp_transforms;
@@ -2780,6 +2792,7 @@ create_ike(char *name, int af, uint8_t ipproto, struct ipsec_hosts *hosts,
 		prop[1].prop_xforms = ipsecxforms;
 	}
 	TAILQ_INSERT_TAIL(&pol.pol_proposals, &prop[1], prop_entry);
+	pol.pol_nproposals++;
 
 	if (hosts == NULL || hosts->src == NULL || hosts->dst == NULL)
 		fatalx("create_ike: no traffic selectors/flows");

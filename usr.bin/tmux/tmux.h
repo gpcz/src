@@ -1,4 +1,4 @@
-/* $OpenBSD: tmux.h,v 1.807 2017/10/16 19:30:53 nicm Exp $ */
+/* $OpenBSD: tmux.h,v 1.815 2017/12/19 15:00:39 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -1885,7 +1885,7 @@ void	 server_client_set_key_table(struct client *, const char *);
 const char *server_client_get_key_table(struct client *);
 int	 server_client_check_nested(struct client *);
 void	 server_client_handle_key(struct client *, key_code);
-void	 server_client_create(int);
+struct client *server_client_create(int);
 int	 server_client_open(struct client *, char **);
 void	 server_client_unref(struct client *);
 void	 server_client_lost(struct client *);
@@ -1996,7 +1996,7 @@ char	*grid_string_cells(struct grid *, u_int, u_int, u_int,
 	     struct grid_cell **, int, int, int);
 void	 grid_duplicate_lines(struct grid *, u_int, struct grid *, u_int,
 	     u_int);
-u_int	 grid_reflow(struct grid *, struct grid *, u_int);
+void	 grid_reflow(struct grid *, u_int, u_int *);
 
 /* grid-view.c */
 void	 grid_view_get_cell(struct grid *, u_int, u_int, struct grid_cell *);
@@ -2037,6 +2037,8 @@ void	 screen_write_putc(struct screen_write_ctx *, const struct grid_cell *,
 	     u_char);
 void	 screen_write_copy(struct screen_write_ctx *, struct screen *, u_int,
 	     u_int, u_int, u_int, bitstr_t *, const struct grid_cell *);
+void	 screen_write_fast_copy(struct screen_write_ctx *, struct screen *,
+	     u_int, u_int, u_int, u_int);
 void	 screen_write_hline(struct screen_write_ctx *, u_int, int, int);
 void	 screen_write_vline(struct screen_write_ctx *, u_int, int, int);
 void	 screen_write_box(struct screen_write_ctx *, u_int, u_int);
@@ -2211,6 +2213,8 @@ void		 layout_assign_pane(struct layout_cell *, struct window_pane *);
 struct layout_cell *layout_split_pane(struct window_pane *, enum layout_type,
 		     int, int, int);
 void		 layout_close_pane(struct window_pane *);
+int		 layout_spread_cell(struct window *, struct layout_cell *);
+void		 layout_spread_out(struct window_pane *);
 
 /* layout-custom.c */
 char		*layout_dump(struct layout_cell *);
@@ -2223,17 +2227,22 @@ u_int		 layout_set_next(struct window *);
 u_int		 layout_set_previous(struct window *);
 
 /* mode-tree.c */
+typedef void (*mode_tree_build_cb)(void *, u_int, uint64_t *, const char *);
+typedef void (*mode_tree_draw_cb)(void *, void *, struct screen_write_ctx *,
+    u_int, u_int);
+typedef int (*mode_tree_search_cb)(void *, void *, const char *);
+typedef void (*mode_tree_each_cb)(void *, void *, struct client *, key_code);
 u_int	 mode_tree_count_tagged(struct mode_tree_data *);
 void	*mode_tree_get_current(struct mode_tree_data *);
-void	 mode_tree_each_tagged(struct mode_tree_data *, void (*)(void *, void *,
-	     key_code), key_code, int);
+void	 mode_tree_expand_current(struct mode_tree_data *);
+void	 mode_tree_set_current(struct mode_tree_data *, uint64_t);
+void	 mode_tree_each_tagged(struct mode_tree_data *, mode_tree_each_cb,
+	     struct client *, key_code, int);
 void	 mode_tree_up(struct mode_tree_data *, int);
 void	 mode_tree_down(struct mode_tree_data *, int);
 struct mode_tree_data *mode_tree_start(struct window_pane *, struct args *,
-	     void (*)(void *, u_int, uint64_t *, const char *),
-	     struct screen *(*)(void *, void *, u_int, u_int),
-	     int (*)(void *, void *, const char *), void *, const char **,
-	     u_int, struct screen **);
+	     mode_tree_build_cb, mode_tree_draw_cb, mode_tree_search_cb,
+	     void *, const char **, u_int, struct screen **);
 void	 mode_tree_build(struct mode_tree_data *);
 void	 mode_tree_free(struct mode_tree_data *);
 void	 mode_tree_resize(struct mode_tree_data *, u_int, u_int);
@@ -2243,7 +2252,7 @@ struct mode_tree_item *mode_tree_add(struct mode_tree_data *,
 void	 mode_tree_remove(struct mode_tree_data *, struct mode_tree_item *);
 void	 mode_tree_draw(struct mode_tree_data *);
 int	 mode_tree_key(struct mode_tree_data *, struct client *, key_code *,
-	     struct mouse_event *);
+	     struct mouse_event *, u_int *, u_int *);
 void	 mode_tree_run_command(struct client *, struct cmd_find_state *,
 	     const char *, const char *);
 
@@ -2335,6 +2344,7 @@ struct session_group *session_group_new(const char *);
 void		 session_group_add(struct session_group *, struct session *);
 void		 session_group_synchronize_to(struct session *);
 void		 session_group_synchronize_from(struct session *);
+u_int		 session_group_count(struct session_group *);
 void		 session_renumber_windows(struct session *);
 
 /* utf8.c */

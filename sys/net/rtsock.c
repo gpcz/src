@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtsock.c,v 1.251 2017/10/09 08:35:38 mpi Exp $	*/
+/*	$OpenBSD: rtsock.c,v 1.259 2017/12/18 09:40:17 mpi Exp $	*/
 /*	$NetBSD: rtsock.c,v 1.18 1996/03/29 00:32:10 cgd Exp $	*/
 
 /*
@@ -174,7 +174,6 @@ route_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
     struct mbuf *control, struct proc *p)
 {
 	struct routecb	*rop;
-	int		 af;
 	int		 error = 0;
 
 	soassertlocked(so);
@@ -198,20 +197,6 @@ route_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 			rop->flags &= ~ROUTECB_FLAG_FLUSH;
 		break;
 
-	case PRU_DETACH:
-		timeout_del(&rop->timeout);
-		af = rop->rcb.rcb_proto.sp_protocol;
-		if (af == AF_INET)
-			route_cb.ip_count--;
-		else if (af == AF_INET6)
-			route_cb.ip6_count--;
-#ifdef MPLS
-		else if (af == AF_MPLS)
-			route_cb.mpls_count--;
-#endif
-		route_cb.any_count--;
-		LIST_REMOVE(rop, rcb_list);
-		/* FALLTHROUGH */
 	default:
 		error = raw_usrreq(so, req, m, nam, control, p);
 	}
@@ -240,11 +225,15 @@ route_attach(struct socket *so, int proto)
 	if (curproc == NULL)
 		error = EACCES;
 	else
-		error = raw_attach(so, proto);
+		error = soreserve(so, RAWSNDQ, RAWRCVQ);
 	if (error) {
 		free(rop, M_PCB, sizeof(struct routecb));
 		return (error);
 	}
+	rp->rcb_socket = so;
+	rp->rcb_proto.sp_family = so->so_proto->pr_domain->dom_family;
+	rp->rcb_proto.sp_protocol = proto;
+
 	rop->rtableid = curproc->p_p->ps_rtableid;
 	switch (rp->rcb_proto.sp_protocol) {
 	case AF_INET:
@@ -266,6 +255,38 @@ route_attach(struct socket *so, int proto)
 	rp->rcb_faddr = &route_src;
 	route_cb.any_count++;
 	LIST_INSERT_HEAD(&route_cb.rcb, rop, rcb_list);
+
+	return (0);
+}
+
+int
+route_detach(struct socket *so)
+{
+	struct routecb	*rop;
+	int		 af;
+
+	soassertlocked(so);
+
+	rop = sotoroutecb(so);
+	if (rop == NULL)
+		return (EINVAL);
+
+	timeout_del(&rop->timeout);
+	af = rop->rcb.rcb_proto.sp_protocol;
+	if (af == AF_INET)
+		route_cb.ip_count--;
+	else if (af == AF_INET6)
+		route_cb.ip6_count--;
+#ifdef MPLS
+	else if (af == AF_MPLS)
+		route_cb.mpls_count--;
+#endif
+	route_cb.any_count--;
+	LIST_REMOVE(rop, rcb_list);
+
+	so->so_pcb = NULL;
+	sofree(so);
+	free(rop, M_PCB, sizeof(struct routecb));
 
 	return (0);
 }
@@ -673,26 +694,21 @@ route_output(struct mbuf *m, struct socket *so, struct sockaddr *dstaddr,
 	}
 
 	/*
-	 * Do not use goto flush before this point since the message itself
-	 * may be not consistent and could cause unexpected behaviour in other
-	 * userland clients. Use goto fail instead.
-	 */
-
-	/*
 	 * Validate RTM_PROPOSAL and pass it along or error out.
 	 */
 	if (rtm->rtm_type == RTM_PROPOSAL) {
-	       if (rtm_validate_proposal(&info) == -1) {
+		if (rtm_validate_proposal(&info) == -1) {
 			error = EINVAL;
 			goto fail;
-	       }
+		}
 	} else {
 		error = rtm_output(rtm, &rt, &info, prio, tableid);
 		if (!error) {
 			type = rtm->rtm_type;
 			seq = rtm->rtm_seq;
-			free(rtm, M_RTABLE, 0);
+			free(rtm, M_RTABLE, len);
 			rtm = rtm_report(rt, type, seq, tableid);
+			len = rtm->rtm_msglen;
 		}
 	}
 
@@ -710,18 +726,18 @@ route_output(struct mbuf *m, struct socket *so, struct sockaddr *dstaddr,
 		if (route_cb.any_count <= 1) {
 			/* no other listener and no loopback of messages */
 fail:
-			free(rtm, M_RTABLE, 0);
+			free(rtm, M_RTABLE, len);
 			m_freem(m);
 			return (error);
 		}
 	}
 	if (rtm) {
-		if (m_copyback(m, 0, rtm->rtm_msglen, rtm, M_NOWAIT)) {
+		if (m_copyback(m, 0, len, rtm, M_NOWAIT)) {
 			m_freem(m);
 			m = NULL;
-		} else if (m->m_pkthdr.len > rtm->rtm_msglen)
-			m_adj(m, rtm->rtm_msglen - m->m_pkthdr.len);
-		free(rtm, M_RTABLE, 0);
+		} else if (m->m_pkthdr.len > len)
+			m_adj(m, len - m->m_pkthdr.len);
+		free(rtm, M_RTABLE, len);
 	}
 	if (m)
 		route_input(m, so, info.rti_info[RTAX_DST] ?
@@ -876,7 +892,7 @@ rtm_output(struct rt_msghdr *rtm, struct rtentry **prt,
 		 */
 		plen = rtable_satoplen(info->rti_info[RTAX_DST]->sa_family,
 		    info->rti_info[RTAX_NETMASK]);
-		if (rt_plen(rt) != plen ) {
+		if (rt_plen(rt) != plen) {
 			error = ESRCH;
 			break;
 		}
@@ -964,7 +980,8 @@ change:
 				/* if gateway changed remove MPLS information */
 				if (rt->rt_llinfo != NULL &&
 				    rt->rt_flags & RTF_MPLS) {
-					free(rt->rt_llinfo, M_TEMP, 0);
+					free(rt->rt_llinfo, M_TEMP,
+					    sizeof(struct rt_mpls));
 					rt->rt_llinfo = NULL;
 					rt->rt_flags &= ~RTF_MPLS;
 				}
@@ -1146,7 +1163,7 @@ route_cleargateway(struct rtentry *rt, void *arg, unsigned int rtableid)
 
 	if (ISSET(rt->rt_flags, RTF_GATEWAY) && rt->rt_gwroute == nhrt &&
 	    !ISSET(rt->rt_locks, RTV_MTU))
-                rt->rt_mtu = 0;
+		rt->rt_mtu = 0;
 
 	return (0);
 }
@@ -1347,22 +1364,20 @@ again:
 	/* align message length to the next natural boundary */
 	len = ALIGN(len);
 	if (cp == 0 && w != NULL && !second_time) {
-		struct walkarg *rw = w;
-
-		rw->w_needed += len;
-		if (rw->w_needed <= 0 && rw->w_where) {
-			if (rw->w_tmemsize < len) {
-				free(rw->w_tmem, M_RTABLE, 0);
-				rw->w_tmem = malloc(len, M_RTABLE, M_NOWAIT);
-				if (rw->w_tmem)
-					rw->w_tmemsize = len;
+		w->w_needed += len;
+		if (w->w_needed <= 0 && w->w_where) {
+			if (w->w_tmemsize < len) {
+				free(w->w_tmem, M_RTABLE, w->w_tmemsize);
+				w->w_tmem = malloc(len, M_RTABLE, M_NOWAIT);
+				if (w->w_tmem)
+					w->w_tmemsize = len;
 			}
-			if (rw->w_tmem) {
-				cp = rw->w_tmem;
+			if (w->w_tmem) {
+				cp = w->w_tmem;
 				second_time = 1;
 				goto again;
 			} else
-				rw->w_where = 0;
+				w->w_where = 0;
 		}
 	}
 	if (cp && w)		/* clear the message header */
@@ -1470,7 +1485,7 @@ void
 rtm_addr(struct rtentry *rt, int cmd, struct ifaddr *ifa)
 {
 	struct ifnet		*ifp = ifa->ifa_ifp;
-	struct mbuf		*m = NULL;
+	struct mbuf		*m;
 	struct rt_addrinfo	 info;
 	struct ifa_msghdr	*ifam;
 
@@ -1793,7 +1808,7 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 		NET_UNLOCK();
 		break;
 	}
-	free(w.w_tmem, M_RTABLE, 0);
+	free(w.w_tmem, M_RTABLE, w.w_tmemsize);
 	w.w_needed += w.w_given;
 	if (where) {
 		*given = w.w_where - (caddr_t)where;
@@ -1922,6 +1937,7 @@ struct protosw routesw[] = {
   .pr_ctloutput	= route_ctloutput,
   .pr_usrreq	= route_usrreq,
   .pr_attach	= route_attach,
+  .pr_detach	= route_detach,
   .pr_init	= route_prinit,
   .pr_sysctl	= sysctl_rtable
 }

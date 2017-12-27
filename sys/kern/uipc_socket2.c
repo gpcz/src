@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_socket2.c,v 1.86 2017/08/11 21:24:19 mpi Exp $	*/
+/*	$OpenBSD: uipc_socket2.c,v 1.88 2017/12/10 11:31:54 mpi Exp $	*/
 /*	$NetBSD: uipc_socket2.c,v 1.11 1996/02/04 02:17:55 christos Exp $	*/
 
 /*
@@ -329,12 +329,12 @@ sosleep(struct socket *so, void *ident, int prio, const char *wmesg, int timo)
 int
 sbwait(struct socket *so, struct sockbuf *sb)
 {
+	int prio = (sb->sb_flags & SB_NOINTR) ? PSOCK : PSOCK | PCATCH;
+
 	soassertlocked(so);
 
-	sb->sb_flagsintr |= SB_WAIT;
-	return (sosleep(so, &sb->sb_cc,
-	    (sb->sb_flags & SB_NOINTR) ? PSOCK : PSOCK | PCATCH, "netio",
-	    sb->sb_timeo));
+	sb->sb_flags |= SB_WAIT;
+	return (sosleep(so, &sb->sb_cc, prio, "netio", sb->sb_timeo));
 }
 
 int
@@ -342,7 +342,6 @@ sblock(struct socket *so, struct sockbuf *sb, int wait)
 {
 	int error, prio = (sb->sb_flags & SB_NOINTR) ? PSOCK : PSOCK | PCATCH;
 
-	KERNEL_ASSERT_LOCKED();
 	soassertlocked(so);
 
 	if ((sb->sb_flags & SB_LOCK) == 0) {
@@ -363,9 +362,9 @@ sblock(struct socket *so, struct sockbuf *sb, int wait)
 }
 
 void
-sbunlock(struct sockbuf *sb)
+sbunlock(struct socket *so, struct sockbuf *sb)
 {
-	KERNEL_ASSERT_LOCKED();
+	soassertlocked(so);
 
 	sb->sb_flags &= ~SB_LOCK;
 	if (sb->sb_flags & SB_WANT) {
@@ -382,17 +381,18 @@ sbunlock(struct sockbuf *sb)
 void
 sowakeup(struct socket *so, struct sockbuf *sb)
 {
-	KERNEL_ASSERT_LOCKED();
 	soassertlocked(so);
 
-	selwakeup(&sb->sb_sel);
-	sb->sb_flagsintr &= ~SB_SEL;
-	if (sb->sb_flagsintr & SB_WAIT) {
-		sb->sb_flagsintr &= ~SB_WAIT;
+	sb->sb_flags &= ~SB_SEL;
+	if (sb->sb_flags & SB_WAIT) {
+		sb->sb_flags &= ~SB_WAIT;
 		wakeup(&sb->sb_cc);
 	}
+	KERNEL_LOCK();
 	if (so->so_state & SS_ASYNC)
 		csignal(so->so_pgid, SIGIO, so->so_siguid, so->so_sigeuid);
+	selwakeup(&sb->sb_sel);
+	KERNEL_UNLOCK();
 }
 
 /*

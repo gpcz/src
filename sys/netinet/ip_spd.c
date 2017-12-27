@@ -1,4 +1,4 @@
-/* $OpenBSD: ip_spd.c,v 1.93 2017/10/16 08:22:25 mpi Exp $ */
+/* $OpenBSD: ip_spd.c,v 1.96 2017/11/20 10:56:52 mpi Exp $ */
 /*
  * The author of this code is Angelos D. Keromytis (angelos@cis.upenn.edu)
  *
@@ -47,12 +47,6 @@ struct	ipsec_acquire *ipsp_pending_acquire(struct ipsec_policy *,
 	    union sockaddr_union *);
 void	ipsp_delete_acquire_timo(void *);
 void	ipsp_delete_acquire(struct ipsec_acquire *);
-
-#ifdef ENCDEBUG
-#define	DPRINTF(x)	if (encdebug) printf x
-#else
-#define	DPRINTF(x)
-#endif
 
 struct pool ipsec_policy_pool;
 struct pool ipsec_acquire_pool;
@@ -113,6 +107,25 @@ spd_table_add(unsigned int rtableid)
 	}
 
 	return (spd_tables[rdomain]);
+}
+
+int
+spd_table_walk(unsigned int rtableid,
+    int (*func)(struct ipsec_policy *, void *, unsigned int), void *arg)
+{
+	struct radix_node_head *rnh;
+	int (*walker)(struct radix_node *, void *, u_int) = (void *)func;
+	int error;
+
+	rnh = spd_table_get(rtableid);
+	if (rnh == NULL)
+		return (0);
+
+	/* EGAIN means the tree changed. */
+	while ((error = rn_walktree(rnh, walker, arg)) == EAGAIN)
+		continue;
+
+	return (error);
 }
 
 /*

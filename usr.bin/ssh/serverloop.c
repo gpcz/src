@@ -1,4 +1,4 @@
-/* $OpenBSD: serverloop.c,v 1.198 2017/09/12 06:35:32 djm Exp $ */
+/* $OpenBSD: serverloop.c,v 1.202 2017/12/18 23:16:24 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -95,6 +95,9 @@ static volatile sig_atomic_t received_sigterm = 0;
 /* prototypes */
 static void server_init_dispatch(void);
 
+/* requested tunnel forwarding interface(s), shared with session.c */
+char *tun_fwd_ifnames = NULL;
+
 /*
  * we write to this pipe if a SIGCHLD is caught in order to avoid
  * the race between select() and child_terminated
@@ -162,10 +165,12 @@ static void
 client_alive_check(struct ssh *ssh)
 {
 	int channel_id;
+	char remote_id[512];
 
 	/* timeout, check to see how many we have had */
 	if (packet_inc_alive_timeouts() > options.client_alive_count_max) {
-		logit("Timeout, client not responding.");
+		sshpkt_fmt_connection_id(ssh, remote_id, sizeof(remote_id));
+		logit("Timeout, client not responding from %s", remote_id);
 		cleanup_exit(255);
 	}
 
@@ -512,6 +517,7 @@ server_request_tun(struct ssh *ssh)
 	Channel *c = NULL;
 	int mode, tun;
 	int sock;
+	char *tmp, *ifname = NULL;
 
 	mode = packet_get_int();
 	switch (mode) {
@@ -534,12 +540,27 @@ server_request_tun(struct ssh *ssh)
 			goto done;
 		tun = forced_tun_device;
 	}
-	sock = tun_open(tun, mode);
+	sock = tun_open(tun, mode, &ifname);
 	if (sock < 0)
 		goto done;
+	debug("Tunnel forwarding using interface %s", ifname);
+
 	c = channel_new(ssh, "tun", SSH_CHANNEL_OPEN, sock, sock, -1,
 	    CHAN_TCP_WINDOW_DEFAULT, CHAN_TCP_PACKET_DEFAULT, 0, "tun", 1);
 	c->datagram = 1;
+
+	/*
+	 * Update the list of names exposed to the session
+	 * XXX remove these if the tunnels are closed (won't matter
+	 * much if they are already in the environment though)
+	 */
+	tmp = tun_fwd_ifnames;
+	xasprintf(&tun_fwd_ifnames, "%s%s%s",
+	    tun_fwd_ifnames == NULL ? "" : tun_fwd_ifnames,
+	    tun_fwd_ifnames == NULL ? "" : ",",
+	    ifname);
+	free(tmp);
+	free(ifname);
 
  done:
 	if (c == NULL)
@@ -639,7 +660,7 @@ server_input_hostkeys_prove(struct ssh *ssh, struct sshbuf **respp)
 	struct sshbuf *resp = NULL;
 	struct sshbuf *sigbuf = NULL;
 	struct sshkey *key = NULL, *key_pub = NULL, *key_prv = NULL;
-	int r, ndx, success = 0;
+	int r, ndx, kexsigtype, use_kexsigtype, success = 0;
 	const u_char *blob;
 	u_char *sig = 0;
 	size_t blen, slen;
@@ -647,6 +668,8 @@ server_input_hostkeys_prove(struct ssh *ssh, struct sshbuf **respp)
 	if ((resp = sshbuf_new()) == NULL || (sigbuf = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new", __func__);
 
+	kexsigtype = sshkey_type_plain(
+	    sshkey_type_from_name(ssh->kex->hostkey_alg));
 	while (ssh_packet_remaining(ssh) > 0) {
 		sshkey_free(key);
 		key = NULL;
@@ -677,13 +700,20 @@ server_input_hostkeys_prove(struct ssh *ssh, struct sshbuf **respp)
 		sshbuf_reset(sigbuf);
 		free(sig);
 		sig = NULL;
+		/*
+		 * For RSA keys, prefer to use the signature type negotiated
+		 * during KEX to the default (SHA1).
+		 */
+		use_kexsigtype = kexsigtype == KEY_RSA &&
+		    sshkey_type_plain(key->type) == KEY_RSA;
 		if ((r = sshbuf_put_cstring(sigbuf,
 		    "hostkeys-prove-00@openssh.com")) != 0 ||
 		    (r = sshbuf_put_string(sigbuf,
 		    ssh->kex->session_id, ssh->kex->session_id_len)) != 0 ||
 		    (r = sshkey_puts(key, sigbuf)) != 0 ||
 		    (r = ssh->kex->sign(key_prv, key_pub, &sig, &slen,
-		    sshbuf_ptr(sigbuf), sshbuf_len(sigbuf), NULL, 0)) != 0 ||
+		    sshbuf_ptr(sigbuf), sshbuf_len(sigbuf),
+		    use_kexsigtype ? ssh->kex->hostkey_alg : NULL, 0)) != 0 ||
 		    (r = sshbuf_put_string(resp, sig, slen)) != 0) {
 			error("%s: couldn't prepare signature: %s",
 			    __func__, ssh_err(r));

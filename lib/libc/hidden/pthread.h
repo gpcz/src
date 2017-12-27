@@ -1,4 +1,4 @@
-/*	$OpenBSD: pthread.h,v 1.2 2017/09/05 02:40:54 guenther Exp $	*/
+/*	$OpenBSD: pthread.h,v 1.4 2017/11/04 22:53:57 jca Exp $	*/
 /*
  * Copyright (c) 2015 Philip Guenther <guenther@openbsd.org>
  *

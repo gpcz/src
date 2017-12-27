@@ -1,4 +1,4 @@
-#	$OpenBSD: GENERIC,v 1.261 2017/08/28 19:32:53 jasper Exp $g
+#	$OpenBSD: GENERIC,v 1.263 2017/11/27 09:03:37 mpi Exp $g
 #
 # For further information on compiling OpenBSD kernels, see the config(8)
 # man page.
@@ -15,7 +15,6 @@ maxusers	80			# estimated number of users
 
 option		PCIVERBOSE
 option		USBVERBOSE
-#option		MACOBIOVERBOSE
 option		ADBVERBOSE
 option		ALTIVEC
 option		APERTURE	# in-kernel aperture driver for XFree86
@@ -336,6 +335,7 @@ cardbus*	at cardslot?
 pcmcia*		at cardslot?
 cbb*		at pci?
 cardslot*	at cbb?
+ne*		at pcmcia?	# PCMCIA based NE2000 ethernet
 ep*		at pcmcia?	# PCMCIA based 3C5xx ethernet
 an*		at pcmcia?	# Cisco/Aironet
 ath*		at cardbus?	# Atheros AR5k (802.11a/b/g)
