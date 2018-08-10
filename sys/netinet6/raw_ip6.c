@@ -1,4 +1,4 @@
-/*	$OpenBSD: raw_ip6.c,v 1.125 2017/12/04 13:40:35 bluhm Exp $	*/
+/*	$OpenBSD: raw_ip6.c,v 1.129 2018/07/05 21:16:52 bluhm Exp $	*/
 /*	$KAME: raw_ip6.c,v 1.69 2001/03/04 15:55:44 itojun Exp $	*/
 
 /*
@@ -236,10 +236,10 @@ rip6_input(struct mbuf **mp, int *offp, int proto, int af)
 		if (proto == IPPROTO_NONE || proto == IPPROTO_ICMPV6) {
 			m_freem(m);
 		} else {
-			u_int8_t *prvnxtp = ip6_get_prevhdr(m, *offp); /* XXX */
+			int prvnxt = ip6_get_prevhdr(m, *offp);
+
 			icmp6_error(m, ICMP6_PARAM_PROB,
-			    ICMP6_PARAMPROB_NEXTHEADER,
-			    prvnxtp - mtod(m, u_int8_t *));
+			    ICMP6_PARAMPROB_NEXTHEADER, prvnxt);
 		}
 		counters = counters_enter(&ref, ip6counters);
 		counters[ip6s_delivered]--;
@@ -544,14 +544,20 @@ int
 rip6_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 	struct mbuf *control, struct proc *p)
 {
-	struct inpcb *in6p = sotoinpcb(so);
+	struct inpcb *in6p;
 	int error = 0;
-
-	soassertlocked(so);
 
 	if (req == PRU_CONTROL)
 		return (in6_control(so, (u_long)m, (caddr_t)nam,
 		    (struct ifnet *)control));
+
+	soassertlocked(so);
+
+	in6p = sotoinpcb(so);
+	if (in6p == NULL) {
+		error = EINVAL;
+		goto release;
+	}
 
 	switch (req) {
 	case PRU_DISCONNECT:
@@ -654,6 +660,7 @@ rip6_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 			dst.sin6_scope_id = addr6->sin6_scope_id;
 		}
 		error = rip6_output(m, so, sin6tosa(&dst), control);
+		control = NULL;
 		m = NULL;
 		break;
 	}
@@ -666,13 +673,15 @@ rip6_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 	/*
 	 * Not supported.
 	 */
-	case PRU_RCVOOB:
-	case PRU_RCVD:
 	case PRU_LISTEN:
 	case PRU_ACCEPT:
 	case PRU_SENDOOB:
 		error = EOPNOTSUPP;
 		break;
+
+	case PRU_RCVD:
+	case PRU_RCVOOB:
+		return (EOPNOTSUPP);	/* do not free mbuf's */
 
 	case PRU_SOCKADDR:
 		in6_setsockaddr(in6p, nam);
@@ -685,6 +694,8 @@ rip6_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 	default:
 		panic("rip6_usrreq");
 	}
+release:
+	m_freem(control);
 	m_freem(m);
 	return (error);
 }

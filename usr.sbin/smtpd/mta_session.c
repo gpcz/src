@@ -1,4 +1,4 @@
-/*	$OpenBSD: mta_session.c,v 1.98 2017/05/24 21:27:32 gilles Exp $	*/
+/*	$OpenBSD: mta_session.c,v 1.105 2018/07/25 16:00:48 eric Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -23,6 +23,7 @@
 #include <sys/queue.h>
 #include <sys/tree.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 
 #include <ctype.h>
@@ -99,6 +100,7 @@ enum mta_state {
 #define MTA_EXT_AUTH		0x04
 #define MTA_EXT_AUTH_PLAIN     	0x08
 #define MTA_EXT_AUTH_LOGIN     	0x10
+#define MTA_EXT_SIZE     	0x20
 
 struct mta_session {
 	uint64_t		 id;
@@ -117,6 +119,8 @@ struct mta_session {
 	struct event		 ev;
 	struct io		*io;
 	int			 ext;
+
+	size_t			 ext_size;
 
 	size_t			 msgtried;
 	size_t			 msgcount;
@@ -137,6 +141,7 @@ static void mta_session_init(void);
 static void mta_start(int fd, short ev, void *arg);
 static void mta_io(struct io *, int, void *);
 static void mta_free(struct mta_session *);
+static void mta_getnameinfo_cb(void *, int, const char *, const char *);
 static void mta_on_ptr(void *, void *, void *);
 static void mta_on_timeout(struct runq *, void *);
 static void mta_connect(struct mta_session *);
@@ -191,7 +196,7 @@ mta_session(struct mta_relay *relay, struct mta_route *route)
 
 	mta_session_init();
 
-	s = xcalloc(1, sizeof *s, "mta_session");
+	s = xcalloc(1, sizeof *s);
 	s->id = generate_uid();
 	s->relay = relay;
 	s->route = route;
@@ -238,12 +243,7 @@ mta_session(struct mta_relay *relay, struct mta_route *route)
 		evtimer_set(&s->ev, mta_start, s);
 		evtimer_add(&s->ev, &tv);
 	} else if (waitq_wait(&route->dst->ptrname, mta_on_ptr, s)) {
-		m_create(p_lka,  IMSG_MTA_DNS_PTR, 0, 0, -1);
-		m_add_id(p_lka, s->id);
-		m_add_sockaddr(p_lka, s->route->dst->sa);
-		m_close(p_lka);
-		tree_xset(&wait_ptr, s->id, s);
-		s->flags |= MTA_WAIT;
+		resolver_getnameinfo(s->route->dst->sa, 0, mta_getnameinfo_cb, s);
 	}
 }
 
@@ -253,13 +253,13 @@ mta_session_imsg(struct mproc *p, struct imsg *imsg)
 	struct ca_vrfy_resp_msg	*resp_ca_vrfy;
 	struct ca_cert_resp_msg	*resp_ca_cert;
 	struct mta_session	*s;
-	struct mta_host		*h;
 	struct msg		 m;
 	uint64_t		 reqid;
 	const char		*name;
 	void			*ssl;
-	int			 dnserror, status;
-
+	int			 status;
+	struct stat		 sb;
+	
 	switch (imsg->hdr.type) {
 
 	case IMSG_MTA_OPEN_MESSAGE:
@@ -282,31 +282,30 @@ mta_session_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 		}
 
+		if ((s->ext & MTA_EXT_SIZE) && s->ext_size != 0) {
+			if (fstat(imsg->fd, &sb) == -1) {
+				log_debug("debug: mta: failed to stat msg fd");
+				mta_flush_task(s, IMSG_MTA_DELIVERY_TEMPFAIL,
+				    "Could not stat message fd", 0, 0);
+				mta_enter_state(s, MTA_READY);
+				close(imsg->fd);
+				return;
+			}
+			if (sb.st_size > (off_t)s->ext_size) {
+				log_debug("debug: mta: message too large for peer");
+				mta_flush_task(s, IMSG_MTA_DELIVERY_PERMFAIL,
+				    "message too large for peer", 0, 0);
+				mta_enter_state(s, MTA_READY);
+				close(imsg->fd);
+				return;
+			}
+		}
+		
 		s->datafp = fdopen(imsg->fd, "r");
 		if (s->datafp == NULL)
 			fatal("mta: fdopen");
 
 		mta_enter_state(s, MTA_MAIL);
-		return;
-
-	case IMSG_MTA_DNS_PTR:
-		m_msg(&m, imsg);
-		m_get_id(&m, &reqid);
-		m_get_int(&m, &dnserror);
-		if (dnserror)
-			name = NULL;
-		else
-			m_get_string(&m, &name);
-		m_end(&m);
-		s = mta_tree_pop(&wait_ptr, reqid);
-		if (s == NULL)
-			return;
-
-		h = s->route->dst;
-		h->lastptrquery = time(NULL);
-		if (name)
-			h->ptrname = xstrdup(name, "mta: ptr");
-		waitq_run(&h->ptrname, h->ptrname);
 		return;
 
 	case IMSG_MTA_TLS_INIT:
@@ -318,7 +317,7 @@ mta_session_imsg(struct mproc *p, struct imsg *imsg)
 		if (resp_ca_cert->status == CA_FAIL) {
 			if (s->relay->pki_name) {
 				log_info("%016"PRIx64" mta "
-				    "event=closing reason=ca-failure",
+				    "closing reason=ca-failure",
 				    s->id);
 				mta_free(s);
 				return;
@@ -332,9 +331,9 @@ mta_session_imsg(struct mproc *p, struct imsg *imsg)
 			}
 		}
 
-		resp_ca_cert = xmemdup(imsg->data, sizeof *resp_ca_cert, "mta:ca_cert");
+		resp_ca_cert = xmemdup(imsg->data, sizeof *resp_ca_cert);
 		resp_ca_cert->cert = xstrdup((char *)imsg->data +
-		    sizeof *resp_ca_cert, "mta:ca_cert");
+		    sizeof *resp_ca_cert);
 		ssl = ssl_mta_init(resp_ca_cert->name,
 		    resp_ca_cert->cert, resp_ca_cert->cert_len, env->sc_tls_ciphers);
 		if (ssl == NULL)
@@ -353,7 +352,7 @@ mta_session_imsg(struct mproc *p, struct imsg *imsg)
 
 		if (resp_ca_vrfy->status == CA_OK)
 			s->flags |= MTA_VERIFIED;
-		else if (s->relay->flags & F_TLS_VERIFY) {
+		else if (s->relay->flags & RELAY_TLS_VERIFY) {
 			errno = 0;
 			mta_error(s, "SSL certificate check failed");
 			mta_free(s);
@@ -377,7 +376,7 @@ mta_session_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		if (status == LKA_OK) {
-			s->helo = xstrdup(name, "mta_session_imsg");
+			s->helo = xstrdup(name);
 			mta_connect(s);
 		} else {
 			mta_source_error(s->relay, s->route,
@@ -441,6 +440,19 @@ mta_free(struct mta_session *s)
 }
 
 static void
+mta_getnameinfo_cb(void *arg, int gaierrno, const char *host, const char *serv)
+{
+	struct mta_session *s = arg;
+	struct mta_host *h;
+
+	h = s->route->dst;
+	h->lastptrquery = time(NULL);
+	if (host)
+		h->ptrname = xstrdup(host);
+	waitq_run(&h->ptrname, h->ptrname);
+}
+
+static void
 mta_on_timeout(struct runq *runq, void *arg)
 {
 	struct mta_session *s = arg;
@@ -489,9 +501,9 @@ mta_connect(struct mta_session *s)
 			return;
 		}
 		else if (s->relay->heloname)
-			s->helo = xstrdup(s->relay->heloname, "mta_connect");
+			s->helo = xstrdup(s->relay->heloname);
 		else
-			s->helo = xstrdup(env->sc_hostname, "mta_connect");
+			s->helo = xstrdup(env->sc_hostname);
 	}
 
 	if (s->io) {
@@ -550,7 +562,7 @@ mta_connect(struct mta_session *s)
 		schema = "smtp://";
 
 	log_info("%016"PRIx64" mta "
-	    "event=connecting address=%s%s:%d host=%s",
+	    "connecting address=%s%s:%d host=%s",
 	    s->id, schema, sa_to_text(s->route->dst->sa),
 	    portno, s->route->dst->ptrname);
 
@@ -716,7 +728,7 @@ mta_enter_state(struct mta_session *s, int newstate)
 		}
 
 		if (s->msgtried >= MAX_TRYBEFOREDISABLE) {
-			log_info("%016"PRIx64" mta event=host-rejects-all-mails",
+			log_info("%016"PRIx64" mta host-rejects-all-mails",
 			    s->id);
 			mta_route_down(s->relay, s->route);
 			mta_enter_state(s, MTA_QUIT);
@@ -1145,7 +1157,7 @@ mta_io(struct io *io, int evt, void *arg)
 	switch (evt) {
 
 	case IO_CONNECTED:
-		log_info("%016"PRIx64" mta event=connected", s->id);
+		log_info("%016"PRIx64" mta connected", s->id);
 
 		if (s->use_smtps) {
 			io_set_write(io);
@@ -1158,7 +1170,7 @@ mta_io(struct io *io, int evt, void *arg)
 		break;
 
 	case IO_TLSREADY:
-		log_info("%016"PRIx64" mta event=starttls ciphers=%s",
+		log_info("%016"PRIx64" mta starttls ciphers=%s",
 		    s->id, ssl_to_text(io_ssl(s->io)));
 		s->flags |= MTA_TLS;
 
@@ -1206,6 +1218,11 @@ mta_io(struct io *io, int evt, void *arg)
 				s->ext |= MTA_EXT_PIPELINING;
 			else if (strcmp(msg, "DSN") == 0)
 				s->ext |= MTA_EXT_DSN;
+			else if (strncmp(msg, "SIZE ", 5) == 0) {
+				s->ext_size = strtonum(msg+5, 0, UINT32_MAX, &error);
+				if (error == NULL)
+					s->ext |= MTA_EXT_SIZE;
+			}
 		}
 
 		/* continuation reply, we parse out the repeating statuses and ESC */
@@ -1240,7 +1257,7 @@ mta_io(struct io *io, int evt, void *arg)
 			(void)strlcpy(s->replybuf, line, sizeof s->replybuf);
 
 		if (s->state == MTA_QUIT) {
-			log_info("%016"PRIx64" mta event=closed reason=quit messages=%zu",
+			log_info("%016"PRIx64" mta disconnected reason=quit messages=%zu",
 			    s->id, s->msgcount);
 			mta_free(s);
 			return;
@@ -1481,7 +1498,7 @@ mta_error(struct mta_session *s, const char *fmt, ...)
 		    " after %zu message%s sent: %s", s->id, s->msgcount,
 		    (s->msgcount > 1) ? "s" : "", error);
 	else
-		log_info("%016"PRIx64" mta event=error reason=%s",
+		log_info("%016"PRIx64" mta error reason=%s",
 		    s->id, error);
 
 	/*

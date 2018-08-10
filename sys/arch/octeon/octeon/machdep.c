@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.103 2017/12/30 20:46:59 guenther Exp $ */
+/*	$OpenBSD: machdep.c,v 1.106 2018/06/13 14:38:42 visa Exp $ */
 
 /*
  * Copyright (c) 2009, 2010 Miodrag Vallat.
@@ -419,8 +419,6 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 	consinit();
 	printf("Initial setup done, switching console.\n");
 
-#define DEBUG
-#ifdef DEBUG
 #define DUMP_BOOT_DESC(field, format) \
 	printf("boot_desc->" #field ":" #format "\n", boot_desc->field)
 #define DUMP_BOOT_INFO(field, format) \
@@ -466,7 +464,6 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 	DUMP_BOOT_INFO(config_flags, %#x);
 	if (octeon_boot_info->ver_minor >= 3)
 		DUMP_BOOT_INFO(fdt_addr, %#llx);
-#endif
 
 	/*
 	 * It is possible to launch the kernel from the bootloader without
@@ -656,6 +653,11 @@ octeon_tlb_init(void)
 	}
 
 	/*
+	 * Make sure Coprocessor 2 is disabled.
+	 */
+	setsr(getsr() & ~SR_COP_2_BIT);
+
+	/*
 	 * If the UserLocal register is available, let userspace
 	 * access it using the RDHWR instruction.
 	 */
@@ -681,11 +683,11 @@ get_ncpusfound(void)
 {
 	extern struct boot_desc *octeon_boot_desc;
 	uint64_t core_mask = octeon_boot_desc->core_mask;
-	uint64_t i, m, ncpus = 0;
+	uint64_t i, ncpus = 0;
 
-	for (i = 0, m = 1 ; i < MAXCPUS; i++, m <<= 1)
-		if (core_mask & m)
-			ncpus++;
+	/* There has to be 1-to-1 mapping between cpuids and coreids. */
+	for (i = 0; i < OCTEON_MAXCPUS && (core_mask & (1ul << i)) != 0; i++)
+		ncpus++;
 
 	return ncpus;
 }

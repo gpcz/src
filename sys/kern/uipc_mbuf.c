@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_mbuf.c,v 1.252 2017/12/29 23:55:22 bluhm Exp $	*/
+/*	$OpenBSD: uipc_mbuf.c,v 1.256 2018/03/18 21:25:14 deraadt Exp $	*/
 /*	$NetBSD: uipc_mbuf.c,v 1.15.4.1 1996/06/13 17:11:44 cgd Exp $	*/
 
 /*
@@ -149,9 +149,6 @@ struct pool_allocator m_pool_allocator = {
 
 static void (*mextfree_fns[4])(caddr_t, u_int, void *);
 static u_int num_extfree_fns;
-
-const char *mclpool_warnmsg =
-    "WARNING: mclpools limit reached; increase kern.maxclusters";
 
 /*
  * Initialize the mbuf allocator.
@@ -815,11 +812,12 @@ m_adj(struct mbuf *mp, int req_len)
 		while (m != NULL && len > 0) {
 			if (m->m_len <= len) {
 				len -= m->m_len;
+				m->m_data += m->m_len;
 				m->m_len = 0;
 				m = m->m_next;
 			} else {
-				m->m_len -= len;
 				m->m_data += len;
+				m->m_len -= len;
 				len = 0;
 			}
 		}

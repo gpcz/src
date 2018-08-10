@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpd.c,v 1.291 2017/11/21 12:20:34 eric Exp $	*/
+/*	$OpenBSD: smtpd.c,v 1.302 2018/07/25 16:00:48 eric Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -42,6 +42,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
+#include <syslog.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -227,7 +228,7 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 		}
 
-		c->cause = xstrdup(cause, "parent_imsg");
+		c->cause = xstrdup(cause);
 		log_debug("debug: smtpd: kill requested for %u: %s",
 		    c->pid, c->cause);
 		kill(c->pid, SIGTERM);
@@ -437,9 +438,12 @@ main(int argc, char *argv[])
 	int		 save_argc = argc;
 	char		**save_argv = argv;
 	char		*rexec = NULL;
-	struct smtpd	 conf;
+	struct smtpd	*conf;
 
-	env = &conf;
+	if ((conf = config_default()) == NULL)
+		err(1, NULL);
+
+	env = conf;
 
 	flags = 0;
 	opts = 0;
@@ -561,9 +565,11 @@ main(int argc, char *argv[])
 	if (argc || *argv)
 		usage();
 
+	env->sc_opts |= opts;
+
 	ssl_init();
 
-	if (parse_config(&conf, conffile, opts))
+	if (parse_config(conf, conffile, opts))
 		exit(1);
 
 	if (strlcpy(env->sc_conffile, conffile, PATH_MAX)
@@ -963,7 +969,7 @@ imsg_wait(struct imsgbuf *ibuf, struct imsg *imsg, int timeout)
 
 	pfd[0].fd = ibuf->fd;
 	pfd[0].events = POLLIN;
-	
+
 	while (1) {
 		if ((n = imsg_get(ibuf, imsg)) == -1)
 			return -1;
@@ -1209,27 +1215,55 @@ static void
 forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 {
 	char		 ebuf[128], sfn[32];
-	struct delivery_backend	*db;
+	struct dispatcher	*dsp;
 	struct child	*child;
 	pid_t		 pid;
 	int		 allout, pipefd[2];
+	struct passwd	*pw;
+	const char	*pw_name;
+	uid_t	pw_uid;
+	gid_t	pw_gid;
+	const char	*pw_dir;
+
+	dsp = dict_xget(env->sc_dispatchers, deliver->dispatcher);
 
 	log_debug("debug: smtpd: forking mda for session %016"PRIx64
-	    ": \"%s\" as %s", id, deliver->to, deliver->user);
+	    ": %s as %s", id, deliver->userinfo.username,
+	    dsp->u.local.user ? dsp->u.local.user : deliver->userinfo.username);
 
-	db = delivery_backend_lookup(deliver->mode);
-	if (db == NULL) {
-		(void)snprintf(ebuf, sizeof ebuf, "could not find delivery backend");
-		m_create(p_pony, IMSG_MDA_DONE, 0, 0, -1);
-		m_add_id(p_pony, id);
-		m_add_string(p_pony, ebuf);
-		m_close(p_pony);
-		return;
+	if (dsp->u.local.user) {
+		if ((pw = getpwnam(dsp->u.local.user)) == NULL) {
+			(void)snprintf(ebuf, sizeof ebuf,
+			    "delivery user '%s' does not exist",
+			    dsp->u.local.user);
+			m_create(p_pony, IMSG_MDA_DONE, 0, 0, -1);
+			m_add_id(p_pony, id);
+			m_add_string(p_pony, ebuf);
+			m_close(p_pony);
+			return;
+		}
+		pw_name = pw->pw_name;
+		pw_uid = pw->pw_uid;
+		pw_gid = pw->pw_gid;
+		pw_dir = pw->pw_dir;
+	}
+	else {
+		pw_name = deliver->userinfo.username;
+		pw_uid = deliver->userinfo.uid;
+		pw_gid = deliver->userinfo.gid;
+		pw_dir = deliver->userinfo.directory;
 	}
 
-	if (deliver->userinfo.uid == 0 && !db->allow_root) {
+	if (pw_uid == 0 && deliver->mda_exec[0]) {
+		pw_name = deliver->userinfo.username;
+		pw_uid = deliver->userinfo.uid;
+		pw_gid = deliver->userinfo.gid;
+		pw_dir = deliver->userinfo.directory;
+	}
+
+	if (pw_uid == 0 && !dsp->u.local.requires_root) {
 		(void)snprintf(ebuf, sizeof ebuf, "not allowed to deliver to: %s",
-		    deliver->user);
+		    deliver->userinfo.username);
 		m_create(p_pony, IMSG_MDA_DONE, 0, 0, -1);
 		m_add_id(p_pony, id);
 		m_add_string(p_pony, ebuf);
@@ -1285,12 +1319,11 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 		m_close(p);
 		return;
 	}
-
-	if (chdir(deliver->userinfo.directory) < 0 && chdir("/") < 0)
+	if (chdir(pw_dir) < 0 && chdir("/") < 0)
 		err(1, "chdir");
-	if (setgroups(1, &deliver->userinfo.gid) ||
-	    setresgid(deliver->userinfo.gid, deliver->userinfo.gid, deliver->userinfo.gid) ||
-	    setresuid(deliver->userinfo.uid, deliver->userinfo.uid, deliver->userinfo.uid))
+	if (setgroups(1, &pw_gid) ||
+	    setresgid(pw_gid, pw_gid, pw_gid) ||
+	    setresuid(pw_uid, pw_uid, pw_uid))
 		err(1, "forkmda: cannot drop privileges");
 	if (dup2(pipefd[0], STDIN_FILENO) < 0 ||
 	    dup2(allout, STDOUT_FILENO) < 0 ||
@@ -1310,7 +1343,7 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 	/* avoid hangs by setting 5m timeout */
 	alarm(300);
 
-	db->open(deliver);
+	mda_unpriv(dsp, deliver, pw_name, pw_dir);
 }
 
 static void
@@ -1663,9 +1696,10 @@ proc_title(enum smtp_proc_type proc)
 		return "pony express";
 	case PROC_CA:
 		return "klondike";
-	default:
-		return "unknown";
+	case PROC_CLIENT:
+		return "client";
 	}
+	return "unknown";
 }
 
 const char *
@@ -1738,9 +1772,12 @@ imsg_to_str(int type)
 	CASE(IMSG_CTL_VERBOSE);
 	CASE(IMSG_CTL_DISCOVER_EVPID);
 	CASE(IMSG_CTL_DISCOVER_MSGID);
-	CASE(IMSG_CTL_UNCORRUPT_MSGID);
 
 	CASE(IMSG_CTL_SMTP_SESSION);
+
+	CASE(IMSG_GETADDRINFO);
+	CASE(IMSG_GETADDRINFO_END);
+	CASE(IMSG_GETNAMEINFO);
 
 	CASE(IMSG_SETUP_KEY);
 	CASE(IMSG_SETUP_PEER);
@@ -1796,13 +1833,13 @@ imsg_to_str(int type)
 	CASE(IMSG_MTA_DELIVERY_HOLD);
 	CASE(IMSG_MTA_DNS_HOST);
 	CASE(IMSG_MTA_DNS_HOST_END);
-	CASE(IMSG_MTA_DNS_PTR);
 	CASE(IMSG_MTA_DNS_MX);
 	CASE(IMSG_MTA_DNS_MX_PREFERENCE);
 	CASE(IMSG_MTA_HOLDQ_RELEASE);
 	CASE(IMSG_MTA_LOOKUP_CREDENTIALS);
 	CASE(IMSG_MTA_LOOKUP_SOURCE);
 	CASE(IMSG_MTA_LOOKUP_HELO);
+	CASE(IMSG_MTA_LOOKUP_SMARTHOST);
 	CASE(IMSG_MTA_OPEN_MESSAGE);
 	CASE(IMSG_MTA_SCHEDULE);
 	CASE(IMSG_MTA_TLS_INIT);
@@ -1818,7 +1855,6 @@ imsg_to_str(int type)
 	CASE(IMSG_SCHED_ENVELOPE_TRANSFER);
 
 	CASE(IMSG_SMTP_AUTHENTICATE);
-	CASE(IMSG_SMTP_DNS_PTR);
 	CASE(IMSG_SMTP_MESSAGE_COMMIT);
 	CASE(IMSG_SMTP_MESSAGE_CREATE);
 	CASE(IMSG_SMTP_MESSAGE_ROLLBACK);

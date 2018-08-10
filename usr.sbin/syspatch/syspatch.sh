@@ -1,6 +1,6 @@
 #!/bin/ksh
 #
-# $OpenBSD: syspatch.sh,v 1.134 2017/12/29 18:56:36 ajacoutot Exp $
+# $OpenBSD: syspatch.sh,v 1.137 2018/05/09 10:22:06 ajacoutot Exp $
 #
 # Copyright (c) 2016, 2017 Antoine Jacoutot <ajacoutot@openbsd.org>
 #
@@ -44,7 +44,8 @@ apply_patch()
 
 	${_BSDMP} && _s="-s @usr/share/relink/kernel/GENERIC/.*@@g" ||
 		_s="-s @usr/share/relink/kernel/GENERIC.MP/.*@@g"
-	_files="$(tar -xvzphf ${_TMP}/syspatch${_patch}.tgz -C ${_edir} ${_s})"
+	_files="$(tar -xvzphf ${_TMP}/syspatch${_patch}.tgz -C ${_edir} \
+		${_s})" || { rm -r ${_PDIR}/${_patch}; return 1; }
 
 	checkfs ${_files}
 	create_rollback ${_patch} "${_files}"
@@ -159,7 +160,7 @@ ls_missing()
 
 	# don't output anything on stdout to prevent corrupting the patch list
 	unpriv -f "${_sha}.sig" ftp -MVo "${_sha}.sig" "${_MIRROR}/SHA256.sig" \
-		>/dev/null 2>&1 # hide stderr (nonexistent = no patch available)
+		>/dev/null
 	unpriv -f "${_sha}" signify -Veq -x ${_sha}.sig -m ${_sha} -p \
 		/etc/signify/openbsd-${_OSrev}-syspatch.pub >/dev/null
 
@@ -264,7 +265,7 @@ _OSrev=${_KERNV[0]%.*}${_KERNV[0]#*.}
 
 _MIRROR=$(while read _line; do _line=${_line%%#*}; [[ -n ${_line} ]] &&
 	print -r -- "${_line}"; done </etc/installurl | tail -1) 2>/dev/null
-[[ ${_MIRROR} == @(file|http|https)://* ]] ||
+[[ ${_MIRROR} == @(file|ftp|http|https)://* ]] ||
 	sp_err "${0##*/}: invalid URL configured in /etc/installurl"
 _MIRROR="${_MIRROR}/syspatch/${_KERNV[0]}/$(machine)"
 

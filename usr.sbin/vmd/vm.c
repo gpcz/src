@@ -1,4 +1,4 @@
-/*	$OpenBSD: vm.c,v 1.31 2018/01/03 05:39:56 ccardenas Exp $	*/
+/*	$OpenBSD: vm.c,v 1.38 2018/07/17 13:47:06 mlarkin Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -110,7 +110,7 @@ uint8_t vcpu_done[VMM_MAX_VCPUS_PER_VM];
 
 /*
  * Represents a standard register set for an OS to be booted
- * as a flat 32 bit address space, before paging is enabled.
+ * as a flat 64 bit address space.
  *
  * NOT set here are:
  *  RIP
@@ -123,7 +123,7 @@ uint8_t vcpu_done[VMM_MAX_VCPUS_PER_VM];
  * Note - CR3 and various bits in CR0 may be overridden by vmm(4) based on
  *        features of the CPU in use.
  */
-static const struct vcpu_reg_state vcpu_init_flat32 = {
+static const struct vcpu_reg_state vcpu_init_flat64 = {
 #ifdef __i386__
 	.vrs_gprs[VCPU_REGS_EFLAGS] = 0x2,
 	.vrs_gprs[VCPU_REGS_EIP] = 0x0,
@@ -136,7 +136,7 @@ static const struct vcpu_reg_state vcpu_init_flat32 = {
 	.vrs_crs[VCPU_REGS_CR0] = CR0_CD | CR0_NW | CR0_ET | CR0_PE | CR0_PG,
 	.vrs_crs[VCPU_REGS_CR3] = PML4_PAGE,
 	.vrs_crs[VCPU_REGS_CR4] = CR4_PAE | CR4_PSE,
-	.vrs_crs[VCPU_REGS_PDPTE0] = PML3_PAGE | PG_V,
+	.vrs_crs[VCPU_REGS_PDPTE0] = 0ULL,
 	.vrs_crs[VCPU_REGS_PDPTE1] = 0ULL,
 	.vrs_crs[VCPU_REGS_PDPTE2] = 0ULL,
 	.vrs_crs[VCPU_REGS_PDPTE3] = 0ULL,
@@ -319,10 +319,10 @@ start_vm(struct vmd_vm *vm, int fd)
 		vrs = vrp.vrwp_regs;
 	} else {
 		/*
-		 * Set up default "flat 32 bit" register state - RIP,
+		 * Set up default "flat 64 bit" register state - RIP,
 		 * RSP, and GDT info will be set in bootloader
 		 */
-		memcpy(&vrs, &vcpu_init_flat32, sizeof(vrs));
+		memcpy(&vrs, &vcpu_init_flat64, sizeof(vrs));
 
 		/* Find and open kernel image */
 		if ((fp = vmboot_open(vm->vm_kernel,
@@ -502,7 +502,7 @@ send_vm(int fd, struct vm_create_params *vcp)
 	unsigned int		   flags = 0;
 	unsigned int		   i;
 	int			   ret = 0;
-	size_t			   sz; 
+	size_t			   sz;
 
 	if (dump_send_header(fd)) {
 		log_info("%s: failed to send vm dump header", __func__);
@@ -646,7 +646,7 @@ dump_vmr(int fd, struct vm_mem_range *vmr)
 	char	buf[PAGE_SIZE];
 
 	while (rem > 0) {
-		if(read_mem(vmr->vmr_gpa + read, buf, PAGE_SIZE)) {
+		if (read_mem(vmr->vmr_gpa + read, buf, PAGE_SIZE)) {
 			log_warn("failed to read vmr");
 			return (-1);
 		}
@@ -922,6 +922,7 @@ init_emulated_hw(struct vmop_create_params *vmc, int child_cdrom,
 	ioports_map[TIMER_BASE + TIMER_CNTR0] = vcpu_exit_i8253;
 	ioports_map[TIMER_BASE + TIMER_CNTR1] = vcpu_exit_i8253;
 	ioports_map[TIMER_BASE + TIMER_CNTR2] = vcpu_exit_i8253;
+	ioports_map[PCKBC_AUX] = vcpu_exit_i8253_misc;
 
 	/* Init mc146818 RTC */
 	mc146818_init(vcp->vcp_id, memlo, memhi);
@@ -934,6 +935,8 @@ init_emulated_hw(struct vmop_create_params *vmc, int child_cdrom,
 	ioports_map[IO_ICU1 + 1] = vcpu_exit_i8259;
 	ioports_map[IO_ICU2] = vcpu_exit_i8259;
 	ioports_map[IO_ICU2 + 1] = vcpu_exit_i8259;
+	ioports_map[ELCR0] = vcpu_exit_elcr;
+	ioports_map[ELCR1] = vcpu_exit_elcr;
 
 	/* Init ns8250 UART */
 	ns8250_init(con_fd, vcp->vcp_id);
@@ -1105,7 +1108,7 @@ run_vm(int child_cdrom, int *child_disks, int *child_taps,
 			/* caller will exit, so skip freeing */
 			return (ENOMEM);
 		}
-		vrp[i]->vrp_exit = malloc(sizeof(union vm_exit));
+		vrp[i]->vrp_exit = malloc(sizeof(struct vm_exit));
 		if (vrp[i]->vrp_exit == NULL) {
 			log_warn("%s: memory allocation error - "
 			    "exiting.", __progname);
@@ -1315,11 +1318,13 @@ vcpu_run_loop(void *arg)
 		/* Still more pending? */
 		if (i8259_is_pending()) {
 			/* XXX can probably avoid ioctls here by providing intr in vrp */
-			if (vcpu_pic_intr(vrp->vrp_vm_id, vrp->vrp_vcpu_id, 1)) {
+			if (vcpu_pic_intr(vrp->vrp_vm_id,
+			    vrp->vrp_vcpu_id, 1)) {
 				fatal("can't set INTR");
 			}
 		} else {
-			if (vcpu_pic_intr(vrp->vrp_vm_id, vrp->vrp_vcpu_id, 0)) {
+			if (vcpu_pic_intr(vrp->vrp_vm_id,
+			    vrp->vrp_vcpu_id, 0)) {
 				fatal("can't clear INTR");
 			}
 		}
@@ -1389,7 +1394,7 @@ vcpu_pic_intr(uint32_t vm_id, uint32_t vcpu_id, uint8_t intr)
 uint8_t
 vcpu_exit_pci(struct vm_run_params *vrp)
 {
-	union vm_exit *vei = vrp->vrp_exit;
+	struct vm_exit *vei = vrp->vrp_exit;
 	uint8_t intr;
 
 	intr = 0xFF;
@@ -1428,7 +1433,7 @@ vcpu_exit_pci(struct vm_run_params *vrp)
 void
 vcpu_exit_inout(struct vm_run_params *vrp)
 {
-	union vm_exit *vei = vrp->vrp_exit;
+	struct vm_exit *vei = vrp->vrp_exit;
 	uint8_t intr = 0xFF;
 
 	if (ioports_map[vei->vei.vei_port] != NULL)
@@ -1788,7 +1793,8 @@ vcpu_deassert_pic_irq(uint32_t vm_id, uint32_t vcpu_id, int irq)
 
 	if (!i8259_is_pending()) {
 		if (vcpu_pic_intr(vm_id, vcpu_id, 0))
-			fatalx("%s: can't deassert INTR", __func__);
+			fatalx("%s: can't deassert INTR for vm_id %d, "
+			    "vcpu_id %d", __func__, vm_id, vcpu_id);
 	}
 }
 
@@ -1867,7 +1873,7 @@ mutex_unlock(pthread_mutex_t *m)
  *  data: return data
  */
 void
-set_return_data(union vm_exit *vei, uint32_t data)
+set_return_data(struct vm_exit *vei, uint32_t data)
 {
 	switch (vei->vei.vei_size) {
 	case 1:
@@ -1887,16 +1893,17 @@ set_return_data(union vm_exit *vei, uint32_t data)
 /*
  * get_input_data
  *
- * Utility function for manipulating register data in vm exit info structs. This
- * function ensures that the data is copied from the vei->vei.vei_data field with
- * the proper size for the operation being performed.
+ * Utility function for manipulating register data in vm exit info
+ * structs. This function ensures that the data is copied from the
+ * vei->vei.vei_data field with the proper size for the operation being
+ * performed.
  *
  * Parameters:
  *  vei: exit information
  *  data: location to store the result
  */
 void
-get_input_data(union vm_exit *vei, uint32_t *data)
+get_input_data(struct vm_exit *vei, uint32_t *data)
 {
 	switch (vei->vei.vei_size) {
 	case 1:

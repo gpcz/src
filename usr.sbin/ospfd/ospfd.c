@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfd.c,v 1.94 2017/01/24 04:24:25 benno Exp $ */
+/*	$OpenBSD: ospfd.c,v 1.99 2018/07/11 12:09:34 remi Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -29,6 +29,7 @@
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if_types.h>
 
 #include <event.h>
 #include <err.h>
@@ -114,15 +115,13 @@ main(int argc, char *argv[])
 	int			 ipforwarding;
 	int			 mib[4];
 	size_t			 len;
-	char			*sockname;
+	char			*sockname = NULL;
 
 	conffile = CONF_FILE;
 	ospfd_process = PROC_MAIN;
-	sockname = OSPFD_SOCKET;
 
 	log_init(1, LOG_DAEMON);	/* log to stderr until daemonized */
 	log_procinit(log_procnames[ospfd_process]);
-	log_setverbose(1);
 
 	while ((ch = getopt(argc, argv, "cdD:f:ns:v")) != -1) {
 		switch (ch) {
@@ -150,6 +149,7 @@ main(int argc, char *argv[])
 			if (opts & OSPFD_OPT_VERBOSE)
 				opts |= OSPFD_OPT_VERBOSE2;
 			opts |= OSPFD_OPT_VERBOSE;
+			log_setverbose(1);
 			break;
 		default:
 			usage();
@@ -184,6 +184,13 @@ main(int argc, char *argv[])
 		kif_clear();
 		exit(1);
 	}
+
+	if (sockname == NULL) {
+		if (asprintf(&sockname, "%s.%d", OSPFD_SOCKET,
+		    ospfd_conf->rdomain) == -1)
+			err(1, "asprintf");
+	}
+
 	ospfd_conf->csock = sockname;
 
 	if (ospfd_conf->opts & OSPFD_OPT_NOACTION) {
@@ -264,7 +271,7 @@ main(int argc, char *argv[])
 	event_add(&iev_rde->ev, NULL);
 
 	if (kr_init(!(ospfd_conf->flags & OSPFD_FLAG_NO_FIB_UPDATE),
-	    ospfd_conf->rdomain) == -1)
+	    ospfd_conf->rdomain, ospfd_conf->redist_label_or_prefix) == -1)
 		fatalx("kr_init failed");
 
 	/* remove unneeded stuff from config */
@@ -512,18 +519,29 @@ imsg_compose_event(struct imsgev *iev, u_int16_t type, u_int32_t peerid,
 int
 ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 {
+	struct in_addr		 addr;
+	struct kif		*kif;
 	struct redistribute	*r;
-	u_int8_t		 is_default = 0;
+	int		 	 is_default, depend_ok;
+
+	bzero(&addr, sizeof(addr));
 
 	/* only allow 0.0.0.0/0 via REDIST_DEFAULT */
-	if (kr->prefix.s_addr == INADDR_ANY && kr->prefixlen == 0)
-		is_default = 1;
+	is_default = (kr->prefix.s_addr == INADDR_ANY && kr->prefixlen == 0);
 
 	SIMPLEQ_FOREACH(r, &ospfd_conf->redist_list, entry) {
+		if (r->dependon[0] != '\0') {
+			if ((kif = kif_findname(r->dependon, addr, NULL)))
+				depend_ok = ifstate_is_up(kif);
+			else
+				depend_ok = 0;
+		} else
+			depend_ok = 1;
+
 		switch (r->type & ~REDIST_NO) {
 		case REDIST_LABEL:
 			if (kr->rtlabel == r->label) {
-				*metric = r->metric;
+				*metric = depend_ok ? r->metric : MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -538,7 +556,7 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if (kr->flags & F_DYNAMIC)
 				continue;
 			if (kr->flags & F_STATIC) {
-				*metric = r->metric;
+				*metric = depend_ok ? r->metric : MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -548,7 +566,7 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if (kr->flags & F_DYNAMIC)
 				continue;
 			if (kr->flags & F_CONNECTED) {
-				*metric = r->metric;
+				*metric = depend_ok ? r->metric : MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -559,7 +577,8 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if (r->addr.s_addr == INADDR_ANY &&
 			    r->mask.s_addr == INADDR_ANY) {
 				if (is_default) {
-					*metric = r->metric;
+					*metric = depend_ok ? r->metric :
+					    MAX_METRIC;
 					return (r->type & REDIST_NO ? 0 : 1);
 				} else
 					return (0);
@@ -568,13 +587,13 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if ((kr->prefix.s_addr & r->mask.s_addr) ==
 			    (r->addr.s_addr & r->mask.s_addr) &&
 			    kr->prefixlen >= mask2prefixlen(r->mask.s_addr)) {
-				*metric = r->metric;
+				*metric = depend_ok ? r->metric : MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
 		case REDIST_DEFAULT:
 			if (is_default) {
-				*metric = r->metric;
+				*metric = depend_ok ? r->metric : MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -624,7 +643,7 @@ ospf_reload(void)
 
 	merge_config(ospfd_conf, xconf);
 	/* update redistribute lists */
-	kr_reload();
+	kr_reload(ospfd_conf->redist_label_or_prefix);
 	return (0);
 }
 
@@ -654,6 +673,7 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
 	    SIMPLEQ_EMPTY(&xconf->redist_list))
 		rchange = 1;
 	conf->rfc1583compat = xconf->rfc1583compat;
+	conf->redist_label_or_prefix = xconf->redist_label_or_prefix;
 
 	if (ospfd_process == PROC_MAIN) {
 		/* main process does neither use areas nor interfaces */
@@ -841,6 +861,10 @@ merge_interfaces(struct area *a, struct area *xa)
 			if (ospfd_process == PROC_OSPF_ENGINE)
 				if_fsm(i, IF_EVT_UP);
 		}
+
+		strlcpy(i->dependon, xi->dependon,
+		        sizeof(i->dependon));
+		i->depend_ok = xi->depend_ok;
 	}
 	return (dirty);
 }
@@ -856,4 +880,15 @@ iface_lookup(struct area *area, struct iface *iface)
 		    i->mask.s_addr == iface->mask.s_addr)
 			return (i);
 	return (NULL);
+}
+
+int
+ifstate_is_up(struct kif *kif)
+{
+	if (!(kif->flags & IFF_UP))
+		return (0);
+	if (kif->if_type == IFT_CARP &&
+	    kif->link_state == LINK_STATE_UNKNOWN)
+		return (0);
+	return LINK_STATE_IS_UP(kif->link_state);
 }

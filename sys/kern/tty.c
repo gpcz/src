@@ -1,4 +1,4 @@
-/*	$OpenBSD: tty.c,v 1.135 2017/12/30 23:08:29 guenther Exp $	*/
+/*	$OpenBSD: tty.c,v 1.142 2018/08/05 14:23:57 beck Exp $	*/
 /*	$NetBSD: tty.c,v 1.68.4.2 1996/06/06 16:04:52 thorpej Exp $	*/
 
 /*-
@@ -237,7 +237,7 @@ ttyinput(int c, struct tty *tp)
 	int i, error;
 	int s;
 
-	add_tty_randomness(tp->t_dev << 8 | c);
+	enqueue_randomness(tp->t_dev << 8 | c);
 	/*
 	 * If receiver is not enabled, drop it.
 	 */
@@ -792,12 +792,13 @@ ttioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct proc *p)
 			/* ensure user can open the real console */
 			NDINIT(&nid, LOOKUP, FOLLOW, UIO_SYSSPACE, "/dev/console", p);
 			nid.ni_pledge = PLEDGE_RPATH | PLEDGE_WPATH;
+			nid.ni_unveil = UNVEIL_READ | UNVEIL_WRITE;
 			error = namei(&nid);
 			if (error)
 				return (error);
-			vn_lock(nid.ni_vp, LK_EXCLUSIVE | LK_RETRY, p);
+			vn_lock(nid.ni_vp, LK_EXCLUSIVE | LK_RETRY);
 			error = VOP_ACCESS(nid.ni_vp, VREAD, p->p_ucred, p);
-			VOP_UNLOCK(nid.ni_vp, p);
+			VOP_UNLOCK(nid.ni_vp);
 			vrele(nid.ni_vp);
 			if (error)
 				return (error);
@@ -829,7 +830,7 @@ ttioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct proc *p)
 		splx(s);
 		break;
 	case TIOCGPGRP:			/* get pgrp of tty */
-		if (!isctty(pr, tp) && suser(p, 0))
+		if (!isctty(pr, tp) && suser(p))
 			return (ENOTTY);
 		*(int *)data = tp->t_pgrp ? tp->t_pgrp->pg_id : NO_PID;
 		break;
@@ -959,9 +960,6 @@ ttioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct proc *p)
 			ttstart(tp);
 		}
 		splx(s);
-		break;
-	case TIOCSTI:			/* simulate terminal input */
-		return (EIO);
 		break;
 	case TIOCSTOP:			/* stop output, like ^S */
 		s = spltty();
@@ -1703,7 +1701,7 @@ ttwrite(struct tty *tp, struct uio *uio, int flag)
 	int cc, ce, obufcc = 0;
 	struct proc *p;
 	struct process *pr;
-	int i, hiwat, error, s;
+	int hiwat, error, s;
 	size_t cnt;
 	u_char obuf[OBUFSIZ];
 
@@ -1801,6 +1799,7 @@ loop:
 		 * immediately.
 		 */
 		while (cc > 0) {
+			int i;
 			if (!ISSET(tp->t_oflag, OPOST))
 				ce = cc;
 			else {

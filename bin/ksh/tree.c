@@ -1,4 +1,4 @@
-/*	$OpenBSD: tree.c,v 1.28 2018/01/01 19:45:56 millert Exp $	*/
+/*	$OpenBSD: tree.c,v 1.34 2018/04/09 17:53:36 tobias Exp $	*/
 
 /*
  * command tree climbing
@@ -47,25 +47,8 @@ ptree(struct op *t, int indent, struct shf *shf)
 			fptreef(shf, indent, "#no-args# ");
 		break;
 	case TEXEC:
-#if 0 /* ?not useful - can't be called? */
-		/* Print original vars */
-		if (t->left->vars)
-			for (w = t->left->vars; *w != NULL; )
-				fptreef(shf, indent, "%S ", *w++);
-		else
-			fptreef(shf, indent, "#no-vars# ");
-		/* Print expanded vars */
-		if (t->args)
-			for (w = t->args; *w != NULL; )
-				fptreef(shf, indent, "%s ", *w++);
-		else
-			fptreef(shf, indent, "#no-args# ");
-		/* Print original io */
-		t = t->left;
-#else
 		t = t->left;
 		goto Chain;
-#endif
 	case TPAREN:
 		fptreef(shf, indent + 2, "( %T) ", t->left);
 		break;
@@ -382,7 +365,7 @@ vfptreef(struct shf *shf, int indent, const char *fmt, va_list va)
 
 	while ((c = *fmt++)) {
 		if (c == '%') {
-			long n;
+			int64_t n;
 			char *p;
 			int neg;
 
@@ -393,7 +376,7 @@ vfptreef(struct shf *shf, int indent, const char *fmt, va_list va)
 			case 'd': /* decimal */
 				n = va_arg(va, int);
 				neg = n < 0;
-				p = ulton(neg ? -n : n, 10);
+				p = u64ton(neg ? -n : n, 10);
 				if (neg)
 					*--p = '-';
 				while (*p)
@@ -409,7 +392,7 @@ vfptreef(struct shf *shf, int indent, const char *fmt, va_list va)
 				tputS(p, shf);
 				break;
 			case 'u': /* unsigned decimal */
-				p = ulton(va_arg(va, unsigned int), 10);
+				p = u64ton(va_arg(va, unsigned int), 10);
 				while (*p)
 					tputc(*p++, shf);
 				break;
@@ -549,9 +532,9 @@ wdscan(const char *wp, int c)
 				nest--;
 			break;
 		default:
-			internal_errorf(0,
-			    "wdscan: unknown char 0x%x (carrying on)",
-			    wp[-1]);
+			internal_warningf(
+			    "%s: unknown char 0x%x (carrying on)",
+			    __func__, wp[-1]);
 		}
 }
 

@@ -1,7 +1,7 @@
-/*	$OpenBSD: mandoc.h,v 1.188 2017/11/10 22:48:05 jca Exp $ */
+/*	$OpenBSD: mandoc.h,v 1.190 2018/07/28 18:32:30 schwarze Exp $ */
 /*
  * Copyright (c) 2010, 2011, 2014 Kristaps Dzonsons <kristaps@bsd.lv>
- * Copyright (c) 2010-2017 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2010-2018 Ingo Schwarze <schwarze@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -56,6 +56,7 @@ enum	mandocerr {
 	MANDOCERR_STYLE, /* ===== start of style suggestions ===== */
 
 	MANDOCERR_DATE_LEGACY, /* legacy man(7) date format: Dd ... */
+	MANDOCERR_DATE_NORM, /* normalizing date format to: ... */
 	MANDOCERR_TITLE_CASE, /* lower case character in document title */
 	MANDOCERR_RCS_REP, /* duplicate RCS id: ... */
 	MANDOCERR_SEC_TYPO,  /* possible typo in section name: Sh ... */
@@ -68,6 +69,7 @@ enum	mandocerr {
 	MANDOCERR_DELIM_NB, /* no blank before trailing delimiter: macro ... */
 	MANDOCERR_FI_SKIP, /* fill mode already enabled, skipping: fi */
 	MANDOCERR_NF_SKIP, /* fill mode already disabled, skipping: nf */
+	MANDOCERR_DASHDASH, /* verbatim "--", maybe consider using \(em */
 	MANDOCERR_FUNC, /* function name without markup: name() */
 	MANDOCERR_SPACE_EOL, /* whitespace at end of input line */
 	MANDOCERR_COMMENT_BAD, /* bad comment style */

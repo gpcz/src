@@ -1,4 +1,4 @@
-/*	$OpenBSD: gencode.c,v 1.46 2016/11/20 12:45:26 reyk Exp $	*/
+/*	$OpenBSD: gencode.c,v 1.49 2018/06/03 10:29:28 sthen Exp $	*/
 
 /*
  * Copyright (c) 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998
@@ -275,7 +275,7 @@ int no_optimize;
 
 int
 pcap_compile(pcap_t *p, struct bpf_program *program,
-	     char *buf, int optimize, bpf_u_int32 mask)
+	     const char *buf, int optimize, bpf_u_int32 mask)
 {
 	extern int n_errors;
 	int len;
@@ -322,7 +322,7 @@ pcap_compile(pcap_t *p, struct bpf_program *program,
 int
 pcap_compile_nopcap(int snaplen_arg, int linktype_arg,
 		    struct bpf_program *program,
-	     char *buf, int optimize, bpf_u_int32 mask)
+	     const char *buf, int optimize, bpf_u_int32 mask)
 {
 	extern int n_errors;
 	int len;
@@ -707,6 +707,11 @@ init_linktype(type)
 		off_nl = 4;
 		return;
 
+	case DLT_PPP_SERIAL:
+		off_linktype = -1;
+		off_nl = 2;
+		return;
+
 	case DLT_PPP_ETHER:
 		/*
 		 * This does not include the Ethernet header, and
@@ -787,6 +792,8 @@ init_linktype(type)
 		off_nl = 12;
 		return;
 
+	case DLT_USBPCAP:
+		/* FALLTHROUGH */
 	case DLT_RAW:
 		off_linktype = -1;
 		off_nl = 0;

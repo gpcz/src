@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpufunc.h,v 1.21 2017/10/17 20:38:49 deraadt Exp $	*/
+/*	$OpenBSD: cpufunc.h,v 1.30 2018/07/27 21:11:31 kettenis Exp $	*/
 /*	$NetBSD: cpufunc.h,v 1.3 2003/05/08 10:27:43 fvdl Exp $	*/
 
 /*-
@@ -152,18 +152,6 @@ void	setidt(int idx, /*XXX*/caddr_t func, int typ, int dpl);
 
 /* XXXX ought to be in psl.h with spl() functions */
 
-static __inline void
-disable_intr(void)
-{
-	__asm volatile("cli");
-}
-
-static __inline void
-enable_intr(void)
-{
-	__asm volatile("sti");
-}
-
 static __inline u_long
 read_rflags(void)
 {
@@ -179,13 +167,19 @@ write_rflags(u_long ef)
 	__asm volatile("pushq %0; popfq" : : "r" (ef));
 }
 
+static __inline void
+intr_enable(void)
+{
+	__asm volatile("sti");
+}
+
 static __inline u_long
 intr_disable(void)
 {
 	u_long ef;
 
 	ef = read_rflags();
-	disable_intr();
+	__asm volatile("cli");
 	return (ef);
 }
 
@@ -283,7 +277,23 @@ static __inline void
 mwait(u_long extensions, u_int hints)
 {
 
-	__asm volatile("mwait" : : "a" (hints), "c" (extensions));
+	__asm volatile(
+		"	mwait			;"
+		"	mov	$8,%%rcx	;"
+		"	.align	16,0x90		;"
+		"3:	call	5f		;"
+		"4:	pause			;"
+		"	lfence			;"
+		"	call	4b		;"
+		"	.align	16,0xcc		;"
+		"5:	call	7f		;"
+		"6:	pause			;"
+		"	lfence			;"
+		"	call	6b		;"
+		"	.align	16,0xcc		;"
+		"7:	loop	3b		;"
+		"	add	$(16*8),%%rsp"
+	    : "+c" (extensions) : "a" (hints));
 }
 
 static __inline void
@@ -306,6 +316,18 @@ xgetbv(uint32_t reg)
 	return (((uint64_t)hi << 32) | (uint64_t)lo);
 }
 
+static __inline void
+stgi(void)
+{
+	__asm volatile("stgi");
+}
+
+static __inline void
+clgi(void)
+{
+	__asm volatile("clgi");
+}
+
 /* Break into DDB. */
 static __inline void
 breakpoint(void)
@@ -314,6 +336,11 @@ breakpoint(void)
 }
 
 void amd64_errata(struct cpu_info *);
+void cpu_ucode_setup(void);
+void cpu_ucode_apply(struct cpu_info *);
+
+struct cpu_info_full;
+void cpu_enter_pages(struct cpu_info_full *);
 
 #endif /* _KERNEL */
 

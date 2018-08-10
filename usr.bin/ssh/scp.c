@@ -1,4 +1,4 @@
-/* $OpenBSD: scp.c,v 1.194 2017/12/18 17:28:54 millert Exp $ */
+/* $OpenBSD: scp.c,v 1.197 2018/06/01 04:31:48 dtucker Exp $ */
 /*
  * scp - secure remote copy.  This is basically patched BSD rcp which
  * uses ssh to do the data transfer (instead of using rcmd).
@@ -293,7 +293,7 @@ do_cmd(char *host, char *remuser, int port, char *cmd, int *fdin, int *fdout)
 }
 
 /*
- * This functions executes a command simlar to do_cmd(), but expects the
+ * This function executes a command similar to do_cmd(), but expects the
  * input and output descriptors to be setup by a previous call to do_cmd().
  * This way the input and output of two commands can be connected.
  */
@@ -398,6 +398,8 @@ main(int argc, char **argv)
 	addargs(&args, "-oForwardAgent=no");
 	addargs(&args, "-oPermitLocalCommand=no");
 	addargs(&args, "-oClearAllForwardings=yes");
+	addargs(&args, "-oRemoteCommand=none");
+	addargs(&args, "-oRequestTTY=no");
 
 	fflag = tflag = 0;
 	while ((ch = getopt(argc, argv, "dfl:prtvBCc:i:P:q12346S:o:F:")) != -1)
@@ -1067,6 +1069,8 @@ sink(int argc, char **argv)
 				SCREWUP("bad mode");
 			mode = (mode << 3) | (*cp - '0');
 		}
+		if (!pflag)
+			mode &= ~mask;
 		if (*cp++ != ' ')
 			SCREWUP("mode not delimited");
 

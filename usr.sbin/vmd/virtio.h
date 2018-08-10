@@ -1,4 +1,4 @@
-/*	$OpenBSD: virtio.h,v 1.22 2018/01/03 05:39:56 ccardenas Exp $	*/
+/*	$OpenBSD: virtio.h,v 1.26 2018/07/09 08:43:09 mlarkin Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -31,7 +31,7 @@
 #define VIOSCSI_QUEUE_SIZE	128
 #define VIOSCSI_QUEUE_MASK	(VIOSCSI_QUEUE_SIZE - 1)
 
-#define VIONET_QUEUE_SIZE	128
+#define VIONET_QUEUE_SIZE	256
 #define VIONET_QUEUE_MASK	(VIONET_QUEUE_SIZE - 1)
 
 /* VMM Control Interface shutdown timeout (in seconds) */
@@ -99,12 +99,48 @@ struct virtio_vq_info {
 	uint16_t notified_avail;
 };
 
+/*
+ * Each virtio driver has a notifyq method where one or more messages
+ * are ready to be processed on a given virtq.  As such, various
+ * pieces of information are needed to provide ring accounting while
+ * processing a given message such as virtq indexes, vring pointers, and
+ * vring descriptors.
+ */
+struct virtio_vq_acct {
+
+	/* index of previous avail vring message */
+	uint16_t idx;
+
+	/* index of current message containing the request */
+	uint16_t req_idx;
+
+	/* index of current message containing the response */
+	uint16_t resp_idx;
+
+	/* vring descriptor pointer */
+	struct vring_desc *desc;
+
+	/* vring descriptor pointer for request header and data */
+	struct vring_desc *req_desc;
+
+	/* vring descriptor pointer for response header and data */
+	struct vring_desc *resp_desc;
+
+	/* pointer to the available vring */
+	struct vring_avail *avail;
+
+	/* pointer to the used vring */
+	struct vring_used *used;
+};
+
 struct viornd_dev {
 	struct virtio_io_cfg cfg;
 
 	struct virtio_vq_info vq[VIRTIO_MAX_QUEUES];
 
 	uint8_t pci_id;
+	int irq;
+	uint32_t vm_id;
 };
 
 struct vioblk_dev {
@@ -117,6 +153,8 @@ struct vioblk_dev {
 	uint32_t max_xfer;
 
 	uint8_t pci_id;
+	int irq;
+	uint32_t vm_id;
 };
 
 /* vioscsi will use at least 3 queues - 5.6.2 Virtqueues
@@ -142,6 +180,8 @@ struct vioscsi_dev {
 	uint32_t max_xfer;
 
 	uint8_t pci_id;
+	uint32_t vm_id;
+	int irq;
 };
 
 struct vionet_dev {
@@ -216,7 +256,7 @@ uint32_t vring_size(uint32_t);
 
 int virtio_rnd_io(int, uint16_t, uint32_t *, uint8_t *, void *, uint8_t);
 int viornd_dump(int);
-int viornd_restore(int);
+int viornd_restore(int, struct vm_create_params *);
 void viornd_update_qs(void);
 void viornd_update_qa(void);
 int viornd_notifyq(void);
@@ -235,6 +275,7 @@ void vionet_update_qs(struct vionet_dev *);
 void vionet_update_qa(struct vionet_dev *);
 int vionet_notifyq(struct vionet_dev *);
 void vionet_notify_rx(struct vionet_dev *);
+int vionet_notify_tx(struct vionet_dev *);
 void vionet_process_rx(uint32_t);
 int vionet_enq_rx(struct vionet_dev *, char *, ssize_t, int *);
 

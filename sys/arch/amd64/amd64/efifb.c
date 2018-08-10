@@ -1,4 +1,4 @@
-/*	$OpenBSD: efifb.c,v 1.12 2017/10/28 01:48:03 yasuoka Exp $	*/
+/*	$OpenBSD: efifb.c,v 1.17 2018/07/12 12:47:57 fcambus Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -101,6 +101,7 @@ int	 efifb_show_screen(void *, void *, int, void (*cb) (void *, int, int),
 	    void *);
 int	 efifb_list_font(void *, struct wsdisplay_font *);
 int	 efifb_load_font(void *, void *, struct wsdisplay_font *);
+void	 efifb_scrollback(void *, void *, int lines);
 void	 efifb_efiinfo_init(struct efifb *);
 void	 efifb_cnattach_common(void);
 
@@ -133,7 +134,8 @@ struct wsdisplay_accessops efifb_accessops = {
 	.free_screen = efifb_free_screen,
 	.show_screen = efifb_show_screen,
 	.load_font = efifb_load_font,
-	.list_font = efifb_list_font
+	.list_font = efifb_list_font,
+	.scrollback = efifb_scrollback,
 };
 
 struct cfdriver efifb_cd = {
@@ -324,12 +326,6 @@ efifb_ioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 		case 8:
 			*(u_int *)data = WSDISPLAYIO_DEPTH_8;
 			break;
-		case 4:
-			*(u_int *)data = WSDISPLAYIO_DEPTH_4;
-			break;
-		case 1:
-			*(u_int *)data = WSDISPLAYIO_DEPTH_1;
-			break;
 		default:
 			return (-1);
 		}
@@ -397,6 +393,15 @@ efifb_list_font(void *v, struct wsdisplay_font *font)
 	struct rasops_info	*ri = &sc->sc_fb->rinfo;
 
 	return (rasops_list_font(ri, font));
+}
+
+void
+efifb_scrollback(void *v, void *cookie, int lines)
+{
+	struct efifb_softc	*sc = v;
+	struct rasops_info	*ri = &sc->sc_fb->rinfo;
+
+	rasops_scrollback(ri, cookie, lines);
 }
 
 int
@@ -482,6 +487,12 @@ void
 efifb_cndetach(void)
 {
 	efifb_console.detached = 1;
+}
+
+void
+efifb_cnreattach(void)
+{
+	efifb_console.detached = 0;
 }
 
 int

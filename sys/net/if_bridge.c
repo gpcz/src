@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_bridge.c,v 1.299 2017/11/20 10:17:40 mpi Exp $	*/
+/*	$OpenBSD: if_bridge.c,v 1.308 2018/04/19 22:31:25 dlg Exp $	*/
 
 /*
  * Copyright (c) 1999, 2000 Jason L. Wright (jason@thought.net)
@@ -156,10 +156,7 @@ bridge_clone_create(struct if_clone *ifc, int unit)
 	struct ifnet *ifp;
 	int i;
 
-	sc = malloc(sizeof(*sc), M_DEVBUF, M_NOWAIT|M_ZERO);
-	if (!sc)
-		return (ENOMEM);
-
+	sc = malloc(sizeof(*sc), M_DEVBUF, M_WAITOK|M_ZERO);
 	sc->sc_stp = bstp_create(&sc->sc_if);
 	if (!sc->sc_stp) {
 		free(sc, M_DEVBUF, sizeof *sc);
@@ -272,14 +269,20 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	case SIOCBRDGADD:
 	/* bridge(4) does not distinguish between routing/forwarding ports */
 	case SIOCBRDGADDL:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 
 		ifs = ifunit(req->ifbr_ifsname);
+
+		/* try to create the interface if it does't exist */
+		if (ifs == NULL && if_clone_create(req->ifbr_ifsname, 0) == 0)
+			ifs = ifunit(req->ifbr_ifsname);
+
 		if (ifs == NULL) {			/* no such interface */
 			error = ENOENT;
 			break;
 		}
+
 		if (ifs->if_bridgeport != NULL) {
 			p = (struct bridge_iflist *)ifs->if_bridgeport;
 			if (p->bridge_sc == sc)
@@ -333,7 +336,7 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		TAILQ_INSERT_TAIL(&sc->sc_iflist, p, next);
 		break;
 	case SIOCBRDGDEL:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		ifs = ifunit(req->ifbr_ifsname);
 		if (ifs == NULL) {
@@ -351,11 +354,16 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		error = bridge_bifconf(sc, (struct ifbifconf *)data);
 		break;
 	case SIOCBRDGADDS:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		ifs = ifunit(req->ifbr_ifsname);
 		if (ifs == NULL) {			/* no such interface */
 			error = ENOENT;
+			break;
+		}
+		if (ifs->if_type != IFT_ETHER &&
+		    ifs->if_type != IFT_MPLSTUNNEL) {
+			error = EINVAL;
 			break;
 		}
 		if (ifs->if_bridgeport != NULL) {
@@ -385,7 +393,7 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		TAILQ_INSERT_TAIL(&sc->sc_spanlist, p, next);
 		break;
 	case SIOCBRDGDELS:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		TAILQ_FOREACH(p, &sc->sc_spanlist, next) {
 			if (strncmp(p->ifp->if_xname, req->ifbr_ifsname,
@@ -412,6 +420,7 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		}
 		req->ifbr_ifsflags = p->bif_flags;
 		req->ifbr_portno = p->ifp->if_index & 0xfff;
+		req->ifbr_protected = p->bif_protected;
 		if (p->bif_flags & IFBIF_STP) {
 			bp = p->bif_stp;
 			req->ifbr_state = bstp_getstate(bs, bp);
@@ -439,7 +448,7 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		}
 		break;
 	case SIOCBRDGSIFFLGS:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		ifs = ifunit(req->ifbr_ifsname);
 		if (ifs == NULL) {
@@ -499,6 +508,19 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		brop->ifbop_last_tc_time.tv_sec = bs->bs_last_tc_time.tv_sec;
 		brop->ifbop_last_tc_time.tv_usec = bs->bs_last_tc_time.tv_usec;
 		break;
+	case SIOCBRDGSIFPROT:
+		ifs = ifunit(req->ifbr_ifsname);
+		if (ifs == NULL) {
+			error = ENOENT;
+			break;
+		}
+		p = (struct bridge_iflist *)ifs->if_bridgeport;
+		if (p == NULL || p->bridge_sc != sc) {
+			error = ESRCH;
+			break;
+		}
+		p->bif_protected = req->ifbr_protected;
+		break;
 	case SIOCBRDGRTS:
 	case SIOCBRDGGCACHE:
 	case SIOCBRDGGPRI:
@@ -523,7 +545,7 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	case SIOCBRDGSPROTO:
 	case SIOCBRDGSIFPRIO:
 	case SIOCBRDGSIFCOST:
-		error = suser(curproc, 0);
+		error = suser(curproc);
 		break;
 	default:
 		error = ENOTTY;
@@ -597,6 +619,7 @@ bridge_bifconf(struct bridge_softc *sc, struct ifbifconf *bifc)
 		strlcpy(breq->ifbr_ifsname, p->ifp->if_xname, IFNAMSIZ);
 		breq->ifbr_ifsflags = p->bif_flags;
 		breq->ifbr_portno = p->ifp->if_index & 0xfff;
+		breq->ifbr_protected = p->bif_protected;
 		if (p->bif_flags & IFBIF_STP) {
 			bp = p->bif_stp;
 			breq->ifbr_state = bstp_getstate(sc->sc_stp, bp);
@@ -702,6 +725,7 @@ bridge_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 	struct ether_addr *dst;
 	struct bridge_softc *sc;
 	struct bridge_tunneltag *brtag;
+	struct bridge_iflist *ifl;
 	int error;
 
 	/* ifp must be a member interface of the bridge. */
@@ -788,6 +812,12 @@ bridge_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 				}
 			}
 
+			ifl = (struct bridge_iflist *)dst_if->if_bridgeport;
+			KASSERT(ifl != NULL);
+			if (bridge_filterrule(&ifl->bif_brlout, eh, mc) ==
+			    BRL_ACTION_BLOCK)
+				continue;
+
 			error = bridge_ifenqueue(sc, dst_if, mc);
 			if (error)
 				continue;
@@ -851,6 +881,7 @@ bridgeintr_frame(struct bridge_softc *sc, struct ifnet *src_if, struct mbuf *m)
 	struct bridge_rtnode *dst_p;
 	struct ether_addr *dst, *src;
 	struct ether_header eh;
+	u_int32_t protected;
 	int len;
 
 
@@ -963,6 +994,7 @@ bridgeintr_frame(struct bridge_softc *sc, struct ifnet *src_if, struct mbuf *m)
 		bridge_broadcast(sc, src_if, &eh, m);
 		return;
 	}
+	protected = ifl->bif_protected;
 
 	/*
 	 * At this point, we're dealing with a unicast frame going to a
@@ -975,6 +1007,14 @@ bridgeintr_frame(struct bridge_softc *sc, struct ifnet *src_if, struct mbuf *m)
 	ifl = (struct bridge_iflist *)dst_if->if_bridgeport;
 	if ((ifl->bif_flags & IFBIF_STP) &&
 	    (ifl->bif_state == BSTP_IFSTATE_DISCARDING)) {
+		m_freem(m);
+		return;
+	}
+	/*
+	 * Do not transmit if both ports are part of the same protected
+	 * domain.
+	 */
+	if (protected != 0 && (protected & ifl->bif_protected)) {
 		m_freem(m);
 		return;
 	}
@@ -997,6 +1037,25 @@ bridgeintr_frame(struct bridge_softc *sc, struct ifnet *src_if, struct mbuf *m)
 	else {
 		bridge_ifenqueue(sc, dst_if, m);
 	}
+}
+
+/*
+ * Return 1 if `ena' belongs to `ifl', 0 otherwise.
+ */
+int
+bridge_ourether(struct bridge_iflist *ifl, uint8_t *ena)
+{
+	struct arpcom *ac = (struct arpcom *)ifl->ifp;
+
+	if (memcmp(ac->ac_enaddr, ena, ETHER_ADDR_LEN) == 0)
+		return (1);
+
+#if NCARP > 0
+	if (carp_ourether(ifl->ifp, ena))
+		return (1);
+#endif
+
+	return (0);
 }
 
 /*
@@ -1025,7 +1084,6 @@ bridge_process(struct ifnet *ifp, struct mbuf *m)
 	struct bridge_iflist *ifl;
 	struct bridge_iflist *srcifl;
 	struct ether_header *eh;
-	struct arpcom *ac;
 	struct mbuf *mc;
 
 	ifl = (struct bridge_iflist *)ifp->if_bridgeport;
@@ -1064,8 +1122,8 @@ bridge_process(struct ifnet *ifp, struct mbuf *m)
 		 * STP destination address (as stored in bstp_etheraddr)
 		 * is the first of these.
 		 */
-		if (bcmp(eh->ether_dhost, bstp_etheraddr, ETHER_ADDR_LEN - 1)
-		    == 0) {
+		if (memcmp(eh->ether_dhost, bstp_etheraddr,
+		    ETHER_ADDR_LEN - 1) == 0) {
 			if (eh->ether_dhost[ETHER_ADDR_LEN - 1] == 0) {
 				/* STP traffic */
 				if ((m = bstp_input(sc->sc_stp, ifl->bif_stp,
@@ -1108,13 +1166,7 @@ bridge_process(struct ifnet *ifp, struct mbuf *m)
 	TAILQ_FOREACH(ifl, &sc->sc_iflist, next) {
 		if (ifl->ifp->if_type != IFT_ETHER)
 			continue;
-		ac = (struct arpcom *)ifl->ifp;
-		if (bcmp(ac->ac_enaddr, eh->ether_dhost, ETHER_ADDR_LEN) == 0
-#if NCARP > 0
-		    || (ifl->ifp->if_carp && carp_ourether(ifl->ifp->if_carp,
-			(u_int8_t *)&eh->ether_dhost) != NULL)
-#endif
-		    ) {
+		if (bridge_ourether(ifl, eh->ether_dhost)) {
 			if (srcifl->bif_flags & IFBIF_LEARNING)
 				bridge_rtupdate(sc,
 				    (struct ether_addr *)&eh->ether_shost,
@@ -1132,12 +1184,7 @@ bridge_process(struct ifnet *ifp, struct mbuf *m)
 			bridge_ifinput(ifl->ifp, m);
 			return;
 		}
-		if (bcmp(ac->ac_enaddr, eh->ether_shost, ETHER_ADDR_LEN) == 0
-#if NCARP > 0
-		    || (ifl->ifp->if_carp && carp_ourether(ifl->ifp->if_carp,
-			(u_int8_t *)&eh->ether_shost) != NULL)
-#endif
-		    ) {
+		if (bridge_ourether(ifl, eh->ether_shost)) {
 			m_freem(m);
 			return;
 		}
@@ -1162,6 +1209,10 @@ bridge_broadcast(struct bridge_softc *sc, struct ifnet *ifp,
 	struct mbuf *mc;
 	struct ifnet *dst_if;
 	int len, used = 0;
+	u_int32_t protected;
+
+	p = (struct bridge_iflist *)ifp->if_bridgeport;
+	protected = p->bif_protected;
 
 	TAILQ_FOREACH(p, &sc->sc_iflist, next) {
 		dst_if = p->ifp;
@@ -1180,6 +1231,13 @@ bridge_broadcast(struct bridge_softc *sc, struct ifnet *ifp,
 		/* Drop non-IP frames if the appropriate flag is set. */
 		if (p->bif_flags & IFBIF_BLOCKNONIP &&
 		    bridge_blocknonip(eh, m))
+			continue;
+
+		/*
+		 * Do not transmit if both ports are part of the same
+		 * protected domain.
+		 */
+		if (protected != 0 && (protected & p->bif_protected))
 			continue;
 
 		if (bridge_filterrule(&p->bif_brlout, eh, m) == BRL_ACTION_BLOCK)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: init_main.c,v 1.272 2018/01/01 08:23:19 jsg Exp $	*/
+/*	$OpenBSD: init_main.c,v 1.279 2018/07/20 21:57:26 deraadt Exp $	*/
 /*	$NetBSD: init_main.c,v 1.84.4.1 1996/06/02 09:08:06 mrg Exp $	*/
 
 /*
@@ -124,6 +124,7 @@ extern	struct user *proc0paddr;
 struct	vnode *rootvp, *swapdev_vp;
 int	boothowto;
 struct	timespec boottime;
+int	db_active = 0;
 int	ncpus =  1;
 int	ncpusfound = 1;			/* number of cpus we find */
 volatile int start_init_exec;		/* semaphore for start_init() */
@@ -158,7 +159,6 @@ extern char *syscallnames[];
 struct emul emul_native = {
 	"native",
 	NULL,
-	sendsig,
 	SYS_syscall,
 	SYS_MAXSYSCALL,
 	sysent,
@@ -174,8 +174,7 @@ struct emul emul_native = {
 	NULL,		/* coredump */
 	sigcode,
 	esigcode,
-	sigcoderet,
-	EMUL_ENABLED | EMUL_NATIVE,
+	sigcoderet
 };
 
 
@@ -492,7 +491,7 @@ main(void *framep)
 		panic("cannot find root vnode");
 	p->p_fd->fd_cdir = rootvnode;
 	vref(p->p_fd->fd_cdir);
-	VOP_UNLOCK(rootvnode, p);
+	VOP_UNLOCK(rootvnode);
 	p->p_fd->fd_rdir = NULL;
 
 	/*
@@ -651,7 +650,7 @@ start_init(void *arg)
 	if (uvm_map(&p->p_vmspace->vm_map, &addr, PAGE_SIZE, 
 	    NULL, UVM_UNKNOWN_OFFSET, 0,
 	    UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_MASK, MAP_INHERIT_COPY,
-	    MADV_NORMAL, UVM_FLAG_FIXED|UVM_FLAG_OVERLAY|UVM_FLAG_COPYONW)))
+	    MADV_NORMAL, UVM_FLAG_FIXED|UVM_FLAG_OVERLAY|UVM_FLAG_COPYONW|UVM_FLAG_STACK)))
 		panic("init: couldn't allocate argument space");
 
 	for (pathp = &initpaths[0]; (path = *pathp) != NULL; pathp++) {

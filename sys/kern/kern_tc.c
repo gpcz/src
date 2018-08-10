@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_tc.c,v 1.31 2017/03/07 20:22:37 dhill Exp $ */
+/*	$OpenBSD: kern_tc.c,v 1.33 2018/05/28 18:05:42 guenther Exp $ */
 
 /*
  * Copyright (c) 2000 Poul-Henning Kamp <phk@FreeBSD.org>
@@ -278,7 +278,7 @@ tc_init(struct timecounter *tc)
 	    tc->tc_frequency < timecounter->tc_frequency)
 		return;
 	(void)tc->tc_get_timecount(tc);
-	add_timer_randomness(tc->tc_get_timecount(tc));
+	enqueue_randomness(tc->tc_get_timecount(tc));
 
 	timecounter = tc;
 }
@@ -297,7 +297,7 @@ tc_getfrequency(void)
  * XXX: not locked.
  */
 void
-tc_setrealtimeclock(struct timespec *ts)
+tc_setrealtimeclock(const struct timespec *ts)
 {
 	struct timespec ts2;
 	struct bintime bt, bt2;
@@ -308,7 +308,7 @@ tc_setrealtimeclock(struct timespec *ts)
 	bintime_add(&bt2, &boottimebin);
 	boottimebin = bt;
 	bintime2timespec(&bt, &boottime);
-	add_timer_randomness(ts->tv_sec);
+	enqueue_randomness(ts->tv_sec);
 
 	/* XXX fiddle all the little crinkly bits around the fiords... */
 	tc_windup();
@@ -326,7 +326,7 @@ tc_setrealtimeclock(struct timespec *ts)
  * XXX: not locked.
  */
 void
-tc_setclock(struct timespec *ts)
+tc_setclock(const struct timespec *ts)
 {
 	struct bintime bt, bt2;
 #ifndef SMALL_KERNEL
@@ -343,7 +343,7 @@ tc_setclock(struct timespec *ts)
 		return;
 	}
 
-	add_timer_randomness(ts->tv_sec);
+	enqueue_randomness(ts->tv_sec);
 
 	timespec2bintime(ts, &bt);
 	bintime_sub(&bt, &boottimebin);

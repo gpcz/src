@@ -1,4 +1,4 @@
-/*	$OpenBSD: edit.c,v 1.59 2018/01/01 19:45:56 millert Exp $	*/
+/*	$OpenBSD: edit.c,v 1.66 2018/06/18 17:03:58 millert Exp $	*/
 
 /*
  * Command line editing - common code
@@ -6,7 +6,6 @@
  */
 
 #include "config.h"
-#ifdef EDIT
 
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -81,10 +80,10 @@ check_sigwinch(void)
 				    ws.ws_col;
 
 				if ((vp = typeset("COLUMNS", 0, 0, 0, 0)))
-					setint(vp, (long) ws.ws_col);
+					setint(vp, (int64_t) ws.ws_col);
 			}
 			if (ws.ws_row && (vp = typeset("LINES", 0, 0, 0, 0)))
-				setint(vp, (long) ws.ws_row);
+				setint(vp, (int64_t) ws.ws_row);
 		}
 	}
 }
@@ -139,10 +138,10 @@ x_flush(void)
 	shf_flush(shl_out);
 }
 
-void
+int
 x_putc(int c)
 {
-	shf_putc(c, shl_out);
+	return shf_putc(c, shl_out);
 }
 
 void
@@ -373,7 +372,7 @@ x_file_glob(int flags, const char *str, int slen, char ***wordsp)
 	source = s;
 	if (yylex(ONEWORD|UNESCAPE) != LWORD) {
 		source = sold;
-		internal_errorf(0, "fileglob: substitute error");
+		internal_warningf("%s: substitute error", __func__);
 		return 0;
 	}
 	source = sold;
@@ -617,12 +616,12 @@ x_try_array(const char *buf, int buflen, const char *want, int wantlen,
 
 	/* Try to find the array. */
 	if (asprintf(&name, "complete_%.*s_%d", cmdlen, cmd, n) < 0)
-		internal_errorf(1, "unable to allocate memory");
+		internal_errorf("unable to allocate memory");
 	v = global(name);
 	free(name);
 	if (~v->flag & (ISSET|ARRAY)) {
 		if (asprintf(&name, "complete_%.*s", cmdlen, cmd) < 0)
-			internal_errorf(1, "unable to allocate memory");
+			internal_errorf("unable to allocate memory");
 		v = global(name);
 		free(name);
 		if (~v->flag & (ISSET|ARRAY))
@@ -910,4 +909,3 @@ x_escape(const char *s, size_t len, int (*putbuf_func) (const char *, size_t))
 
 	return (rval);
 }
-#endif /* EDIT */

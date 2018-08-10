@@ -1,7 +1,7 @@
-/*	$OpenBSD: term_ascii.c,v 1.44 2017/08/23 10:50:11 schwarze Exp $ */
+/*	$OpenBSD: term_ascii.c,v 1.46 2018/05/20 21:37:11 schwarze Exp $ */
 /*
  * Copyright (c) 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
- * Copyright (c) 2014, 2015, 2017 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2014, 2015, 2017, 2018 Ingo Schwarze <schwarze@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,10 +18,12 @@
 #include <sys/types.h>
 
 #include <assert.h>
+#include <langinfo.h>
 #include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <wchar.h>
 
@@ -89,7 +91,17 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 		v = TERMENC_LOCALE == enc ?
 		    setlocale(LC_CTYPE, "") :
 		    setlocale(LC_CTYPE, "en_US.UTF-8");
-		if (NULL != v && MB_CUR_MAX > 1) {
+
+		/*
+		 * We only support UTF-8,
+		 * so revert to ASCII for anything else.
+		 */
+
+		if (v != NULL &&
+		    strcmp(nl_langinfo(CODESET), "UTF-8") != 0)
+			v = setlocale(LC_CTYPE, "C");
+
+		if (v != NULL && MB_CUR_MAX > 1) {
 			p->enc = enc;
 			p->advance = locale_advance;
 			p->endline = locale_endline;
@@ -109,6 +121,8 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 	if (outopts->synopsisonly)
 		p->synopsisonly = 1;
 
+	assert(p->defindent < UINT16_MAX);
+	assert(p->defrmargin < UINT16_MAX);
 	return p;
 }
 
@@ -147,6 +161,8 @@ ascii_setwidth(struct termp *p, int iop, int width)
 		p->defrmargin -= width;
 	else
 		p->defrmargin = 0;
+	if (p->defrmargin > 1000)
+		p->defrmargin = 1000;
 	p->lastrmargin = p->tcol->rmargin;
 	p->tcol->rmargin = p->maxrmargin = p->defrmargin;
 }
@@ -215,6 +231,7 @@ ascii_advance(struct termp *p, size_t len)
 {
 	size_t		i;
 
+	assert(len < UINT16_MAX);
 	for (i = 0; i < len; i++)
 		putchar(' ');
 }
@@ -351,6 +368,7 @@ locale_advance(struct termp *p, size_t len)
 {
 	size_t		i;
 
+	assert(len < UINT16_MAX);
 	for (i = 0; i < len; i++)
 		putwchar(L' ');
 }

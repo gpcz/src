@@ -1,4 +1,4 @@
-#	$OpenBSD: test-exec.sh,v 1.61 2017/07/28 10:32:08 dtucker Exp $
+#	$OpenBSD: test-exec.sh,v 1.63 2018/05/22 00:22:49 djm Exp $
 #	Placed in the Public Domain.
 
 USER=`id -un`
@@ -235,7 +235,10 @@ fail ()
 	save_debug_log "FAIL: $@"
 	RESULT=1
 	echo "$@"
-
+	if test "x$TEST_SSH_FAIL_FATAL" != "x" ; then
+		cleanup
+		exit $RESULT
+	fi
 }
 
 fatal ()
@@ -362,6 +365,7 @@ if test "$REGRESS_INTEROP_PUTTY" = "yes" ; then
 	# Add a PuTTY key to authorized_keys
 	rm -f ${OBJ}/putty.rsa2
 	if ! puttygen -t rsa -o ${OBJ}/putty.rsa2 \
+	    --random-device=/dev/urandom \
 	    --new-passphrase /dev/null < /dev/null > /dev/null; then
 		echo "Your installed version of PuTTY is too old to support --new-passphrase; trying without (may require manual interaction) ..." >&2
 		puttygen -t rsa -o ${OBJ}/putty.rsa2 < /dev/null > /dev/null

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_input.c,v 1.336 2017/12/29 17:05:25 bluhm Exp $	*/
+/*	$OpenBSD: ip_input.c,v 1.338 2018/07/10 11:34:12 mpi Exp $	*/
 /*	$NetBSD: ip_input.c,v 1.30 1996/03/16 23:53:58 christos Exp $	*/
 
 /*
@@ -341,9 +341,8 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
 	}
 
 #if NCARP > 0
-	if (ifp->if_type == IFT_CARP &&
-	    carp_lsdrop(m, AF_INET, &ip->ip_src.s_addr, &ip->ip_dst.s_addr,
-	    (ip->ip_p == IPPROTO_ICMP ? 0 : 1)))
+	if (carp_lsdrop(ifp, m, AF_INET, &ip->ip_src.s_addr,
+	    &ip->ip_dst.s_addr, (ip->ip_p == IPPROTO_ICMP ? 0 : 1)))
 		goto bad;
 #endif
 
@@ -451,8 +450,9 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
 	}
 
 #if NCARP > 0
-	if (ifp->if_type == IFT_CARP && ip->ip_p == IPPROTO_ICMP &&
-	    carp_lsdrop(m, AF_INET, &ip->ip_src.s_addr, &ip->ip_dst.s_addr, 1))
+	if (ip->ip_p == IPPROTO_ICMP &&
+	    carp_lsdrop(ifp, m, AF_INET, &ip->ip_src.s_addr,
+	    &ip->ip_dst.s_addr, 1))
 		goto bad;
 #endif
 	/*
@@ -1623,6 +1623,7 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (error);
 #ifdef IPSEC
 	case IPCTL_ENCDEBUG:
+	case IPCTL_IPSEC_STATS:
 	case IPCTL_IPSEC_EXPIRE_ACQUIRE:
 	case IPCTL_IPSEC_EMBRYONIC_SA_TIMEOUT:
 	case IPCTL_IPSEC_REQUIRE_PFS:

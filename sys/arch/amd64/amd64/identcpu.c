@@ -1,4 +1,4 @@
-/*	$OpenBSD: identcpu.c,v 1.90 2017/10/18 12:52:06 mikeb Exp $	*/
+/*	$OpenBSD: identcpu.c,v 1.105 2018/08/08 05:07:46 jsg Exp $	*/
 /*	$NetBSD: identcpu.c,v 1.1 2003/04/26 18:39:28 fvdl Exp $	*/
 
 /*
@@ -46,6 +46,7 @@
 #include <machine/cpufunc.h>
 
 void	replacesmap(void);
+void	replacemeltdown(void);
 uint64_t cpu_freq(struct cpu_info *);
 void	tsc_timecounter_init(struct cpu_info *, uint64_t);
 #if NVMM > 0
@@ -160,9 +161,15 @@ const struct {
 	{ CPUIDECX_SKINIT,	"SKINIT" },
 	{ CPUIDECX_LWP,		"WDT" },
 	{ CPUIDECX_FMA4,	"FMA4" },
+	{ CPUIDECX_TCE,		"TCE" },
 	{ CPUIDECX_NODEID,	"NODEID" },
 	{ CPUIDECX_TBM,		"TBM" },
 	{ CPUIDECX_TOPEXT,	"TOPEXT" },
+	{ CPUIDECX_CPCTR,	"CPCTR" },
+	{ CPUIDECX_DBKP,	"DBKP" },
+	{ CPUIDECX_PERFTSC,	"PERFTSC" },
+	{ CPUIDECX_PCTRL3,	"PCTRL3" },
+	{ CPUIDECX_MWAITX,	"MWAITX" },
 }, cpu_seff0_ebxfeatures[] = {
 	{ SEFF0EBX_FSGSBASE,	"FSGSBASE" },
 	{ SEFF0EBX_SGX,		"SGX" },
@@ -197,6 +204,13 @@ const struct {
 	{ SEFF0ECX_AVX512VBMI,	"AVX512VBMI" },
 	{ SEFF0ECX_UMIP,	"UMIP" },
 	{ SEFF0ECX_PKU,		"PKU" },
+}, cpu_seff0_edxfeatures[] = {
+	{ SEFF0EDX_AVX512_4FNNIW, "AVX512FNNIW" },
+	{ SEFF0EDX_AVX512_4FMAPS, "AVX512FMAPS" },
+	{ SEFF0EDX_IBRS,	"IBRS,IBPB" },
+	{ SEFF0EDX_STIBP,	"STIBP" },
+	 /* SEFF0EDX_ARCH_CAP (not printed) */
+	{ SEFF0EDX_SSBD,	"SSBD" },
 }, cpu_tpm_eaxfeatures[] = {
 	{ TPM_SENSOR,		"SENSOR" },
 	{ TPM_ARAT,		"ARAT" },
@@ -204,6 +218,18 @@ const struct {
 	{ CPUIDEAX_VERID,	"PERF" },
 }, cpu_cpuid_apmi_edx[] = {
 	{ CPUIDEDX_ITSC,	"ITSC" },
+}, cpu_amdspec_ebxfeatures[] = {
+	{ CPUIDEBX_IBPB,	"IBPB" },
+	{ CPUIDEBX_IBRS,	"IBRS" },
+	{ CPUIDEBX_STIBP,	"STIBP" },
+	{ CPUIDEBX_SSBD,	"SSBD" },
+	{ CPUIDEBX_VIRT_SSBD,	"VIRTSSBD" },
+	{ CPUIDEBX_SSBD_NOTREQ,	"SSBDNR" },
+}, cpu_xsave_extfeatures[] = {
+	{ XSAVE_XSAVEOPT,	"XSAVEOPT" },
+	{ XSAVE_XSAVEC,		"XSAVEC" },
+	{ XSAVE_XGETBV1,	"XGETBV1" },
+	{ XSAVE_XSAVES,		"XSAVES" },
 };
 
 int
@@ -560,7 +586,7 @@ identifycpu(struct cpu_info *ci)
 	if (cpuid_level >= 0x07) {
 		/* "Structured Extended Feature Flags" */
 		CPUID_LEAF(0x7, 0, dummy, ci->ci_feature_sefflags_ebx,
-		    ci->ci_feature_sefflags_ecx, dummy);
+		    ci->ci_feature_sefflags_ecx, ci->ci_feature_sefflags_edx);
 		for (i = 0; i < nitems(cpu_seff0_ebxfeatures); i++)
 			if (ci->ci_feature_sefflags_ebx &
 			    cpu_seff0_ebxfeatures[i].bit)
@@ -569,6 +595,10 @@ identifycpu(struct cpu_info *ci)
 			if (ci->ci_feature_sefflags_ecx &
 			    cpu_seff0_ecxfeatures[i].bit)
 				printf(",%s", cpu_seff0_ecxfeatures[i].str);
+		for (i = 0; i < nitems(cpu_seff0_edxfeatures); i++)
+			if (ci->ci_feature_sefflags_edx &
+			    cpu_seff0_edxfeatures[i].bit)
+				printf(",%s", cpu_seff0_edxfeatures[i].str);
 	}
 
 	if (!strcmp(cpu_vendor, "GenuineIntel") && cpuid_level >= 0x06) {
@@ -582,9 +612,57 @@ identifycpu(struct cpu_info *ci)
 			ci->ci_feature_tpmflags |= TPM_ARAT;
 	}
 
+	/* AMD speculation control features */
+	if (!strcmp(cpu_vendor, "AuthenticAMD")) {
+		if (ci->ci_pnfeatset >= 0x80000008) {
+			CPUID(0x80000008, dummy, ci->ci_feature_amdspec_ebx,
+			    dummy, dummy);
+			for (i = 0; i < nitems(cpu_amdspec_ebxfeatures); i++)
+				if (ci->ci_feature_amdspec_ebx &
+				    cpu_amdspec_ebxfeatures[i].bit)
+					printf(",%s",
+					    cpu_amdspec_ebxfeatures[i].str);
+		}
+	}
+
+	/* xsave subfeatures */
+	if (cpuid_level >= 0xd) {
+		CPUID_LEAF(0xd, 1, val, dummy, dummy, dummy);
+		for (i = 0; i < nitems(cpu_xsave_extfeatures); i++)
+			if (val & cpu_xsave_extfeatures[i].bit)
+				printf(",%s", cpu_xsave_extfeatures[i].str);
+	}
+
+	if (cpu_meltdown)
+		printf(",MELTDOWN");
+	else
+		replacemeltdown();
+
 	printf("\n");
 
 	x86_print_cacheinfo(ci);
+
+	/*
+	 * "Mitigation G-2" per AMD's Whitepaper "Software Techniques
+	 * for Managing Speculation on AMD Processors"
+	 *
+	 * By setting MSR C001_1029[1]=1, LFENCE becomes a dispatch
+	 * serializing instruction.
+	 *
+	 * This MSR is available on all AMD families >= 10h, except 11h
+	 * where LFENCE is always serializing.
+	 */
+	if (!strcmp(cpu_vendor, "AuthenticAMD")) {
+		if (ci->ci_family >= 0x10 && ci->ci_family != 0x11) {
+			uint64_t msr;
+
+			msr = rdmsr(MSR_DE_CFG);
+			if ((msr & DE_CFG_SERIALIZE_LFENCE) == 0) {
+				msr |= DE_CFG_SERIALIZE_LFENCE;
+				wrmsr(MSR_DE_CFG, msr);
+			}
+		}
+	}
 
 	/*
 	 * Attempt to disable Silicon Debug and lock the configuration
@@ -744,17 +822,32 @@ cpu_topology(struct cpu_info *ci)
 		if (ci->ci_pnfeatset < 0x80000008)
 			goto no_topology;
 
-		CPUID(0x80000008, eax, ebx, ecx, edx);
-		core_bits = (ecx >> 12) & 0xf;
-		if (core_bits == 0)
-			goto no_topology;
-		/* So coreidsize 2 gives 3, 3 gives 7... */
-		core_mask = (1 << core_bits) - 1;
-		/* Core id is the least significant considering mask */
-		ci->ci_core_id = apicid & core_mask;
-		/* Pkg id is the upper remaining bits */
-		ci->ci_pkg_id = apicid & ~core_mask;
-		ci->ci_pkg_id >>= core_bits;
+		if (ci->ci_pnfeatset >= 0x8000001e) {
+			struct cpu_info *ci_other;
+			CPU_INFO_ITERATOR cii;
+
+			CPUID(0x8000001e, eax, ebx, ecx, edx);
+			ci->ci_core_id = ebx & 0xff;
+			ci->ci_pkg_id = ecx & 0xff;
+			ci->ci_smt_id = 0;
+			CPU_INFO_FOREACH(cii, ci_other) {
+				if (ci != ci_other &&
+				    ci_other->ci_core_id == ci->ci_core_id)
+					ci->ci_smt_id++;
+			}
+		} else {
+			CPUID(0x80000008, eax, ebx, ecx, edx);
+			core_bits = (ecx >> 12) & 0xf;
+			if (core_bits == 0)
+				goto no_topology;
+			/* So coreidsize 2 gives 3, 3 gives 7... */
+			core_mask = (1 << core_bits) - 1;
+			/* Core id is the least significant considering mask */
+			ci->ci_core_id = apicid & core_mask;
+			/* Pkg id is the upper remaining bits */
+			ci->ci_pkg_id = apicid & ~core_mask;
+			ci->ci_pkg_id >>= core_bits;
+		}
 	} else if (strcmp(cpu_vendor, "GenuineIntel") == 0) {
 		/* We only support leaf 1/4 detection */
 		if (cpuid_level < 4)

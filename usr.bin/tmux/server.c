@@ -1,4 +1,4 @@
-/* $OpenBSD: server.c,v 1.178 2017/12/19 15:00:39 nicm Exp $ */
+/* $OpenBSD: server.c,v 1.181 2018/08/02 11:56:12 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -202,7 +202,6 @@ server_start(struct tmuxproc *client, struct event_base *base, int lockfd,
 	RB_INIT(&all_window_panes);
 	TAILQ_INIT(&clients);
 	RB_INIT(&sessions);
-	RB_INIT(&session_groups);
 	key_bindings_init();
 
 	gettimeofday(&start_time, NULL);
@@ -244,6 +243,7 @@ server_loop(void)
 {
 	struct client	*c;
 	u_int		 items;
+	struct job	*job;
 
 	do {
 		items = cmdq_next(NULL);
@@ -254,6 +254,9 @@ server_loop(void)
 	} while (items != 0);
 
 	server_client_loop();
+
+	if (!options_get_number(global_options, "exit-empty") && !server_exit)
+		return (0);
 
 	if (!options_get_number(global_options, "exit-unattached")) {
 		if (!RB_EMPTY(&sessions))
@@ -273,6 +276,11 @@ server_loop(void)
 	if (!TAILQ_EMPTY(&clients))
 		return (0);
 
+	LIST_FOREACH(job, &all_jobs, entry) {
+		if ((~job->flags & JOB_NOWAIT) && job->state == JOB_RUNNING)
+			return (0);
+	}
+
 	return (1);
 }
 
@@ -288,8 +296,11 @@ server_send_exit(void)
 	TAILQ_FOREACH_SAFE(c, &clients, entry, c1) {
 		if (c->flags & CLIENT_SUSPENDED)
 			server_client_lost(c);
-		else
+		else {
+			if (c->flags & CLIENT_ATTACHED)
+				notify_client("client-detached", c);
 			proc_send(c->peer, MSG_SHUTDOWN, -1, NULL, 0);
+		}
 		c->session = NULL;
 	}
 

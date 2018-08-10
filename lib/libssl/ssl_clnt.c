@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_clnt.c,v 1.22 2017/10/12 16:06:32 jsing Exp $ */
+/* $OpenBSD: ssl_clnt.c,v 1.26 2018/06/03 15:31:30 jsing Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -510,15 +510,8 @@ ssl3_connect(SSL *s)
 			S3I(s)->hs.state = SSL3_ST_CW_FLUSH;
 
 			/* clear flags */
-			s->s3->flags &= ~SSL3_FLAGS_POP_BUFFER;
 			if (s->internal->hit) {
 				S3I(s)->hs.next_state = SSL_ST_OK;
-				if (s->s3->flags &
-				    SSL3_FLAGS_DELAY_CLIENT_FINISHED) {
-					S3I(s)->hs.state = SSL_ST_OK;
-					s->s3->flags |= SSL3_FLAGS_POP_BUFFER;
-					S3I(s)->delay_buf_pop_ret = 0;
-				}
 			} else {
 				/* Allow NewSessionTicket if ticket expected */
 				if (s->internal->tlsext_ticket_expected)
@@ -595,13 +588,7 @@ ssl3_connect(SSL *s)
 				s->internal->init_buf = NULL;
 			}
 
-			/*
-			 * If we are not 'joining' the last two packets,
-			 * remove the buffering now
-			 */
-			if (!(s->s3->flags & SSL3_FLAGS_POP_BUFFER))
-				ssl_free_wbio_buffer(s);
-			/* else do it later in ssl3_write */
+			ssl_free_wbio_buffer(s);
 
 			s->internal->init_num = 0;
 			s->internal->renegotiate = 0;
@@ -813,7 +800,6 @@ ssl3_get_server_hello(SSL *s)
 	STACK_OF(SSL_CIPHER) *sk;
 	const SSL_CIPHER *cipher;
 	const SSL_METHOD *method;
-	unsigned char *p;
 	unsigned long alg_k;
 	size_t outlen;
 	int i, al, ok;
@@ -1011,21 +997,30 @@ ssl3_get_server_hello(SSL *s)
 		goto f_err;
 	}
 
-	/* TLS extensions. */
-	p = (unsigned char *)CBS_data(&cbs);
-	if (!ssl_parse_serverhello_tlsext(s, &p, CBS_len(&cbs), &al)) {
-		/* 'al' set by ssl_parse_serverhello_tlsext */
+	if (!tlsext_serverhello_parse(s, &cbs, &al)) {
 		SSLerror(s, SSL_R_PARSE_TLSEXT);
 		goto f_err;
 	}
+
+	/*
+	 * Determine if we need to see RI. Strictly speaking if we want to
+	 * avoid an attack we should *always* see RI even on initial server
+	 * hello because the client doesn't see any renegotiation during an
+	 * attack. However this would mean we could not connect to any server
+	 * which doesn't support RI so for the immediate future tolerate RI
+	 * absence on initial connect only.
+	 */
+	if (!S3I(s)->renegotiate_seen &&
+	    !(s->internal->options & SSL_OP_LEGACY_SERVER_CONNECT)) {
+		al = SSL_AD_HANDSHAKE_FAILURE;
+		SSLerror(s, SSL_R_UNSAFE_LEGACY_RENEGOTIATION_DISABLED);
+		goto f_err;
+	}
+
 	if (ssl_check_serverhello_tlsext(s) <= 0) {
 		SSLerror(s, SSL_R_SERVERHELLO_TLSEXT);
 		goto err;
 	}
-
-	/* See if any data remains... */
-	if (p - CBS_data(&cbs) != CBS_len(&cbs))
-		goto truncated;
 
 	return (1);
 
@@ -2054,13 +2049,15 @@ ssl3_send_client_kex_dhe(SSL *s, SESS_CERT *sess_cert, CBB *cbb)
 		SSLerror(s, ERR_R_DH_LIB);
 		goto err;
 	}
-	key_size = DH_size(dh_clnt);
+	if ((key_size = DH_size(dh_clnt)) <= 0) {
+		SSLerror(s, ERR_R_DH_LIB);
+		goto err;
+	}
 	if ((key = malloc(key_size)) == NULL) {
 		SSLerror(s, ERR_R_MALLOC_FAILURE);
 		goto err;
 	}
-	key_len = DH_compute_key(key, dh_srvr->pub_key, dh_clnt);
-	if (key_len <= 0) {
+	if ((key_len = DH_compute_key(key, dh_srvr->pub_key, dh_clnt)) <= 0) {
 		SSLerror(s, ERR_R_DH_LIB);
 		goto err;
 	}
@@ -2118,7 +2115,7 @@ ssl3_send_client_kex_ecdhe_ecp(SSL *s, SESS_CERT *sc, CBB *cbb)
 	}
 
 	/* Generate a new ECDH key pair. */
-	if (!(EC_KEY_generate_key(ecdh))) {
+	if (!EC_KEY_generate_key(ecdh)) {
 		SSLerror(s, ERR_R_ECDH_LIB);
 		goto err;
 	}
@@ -2128,6 +2125,7 @@ ssl3_send_client_kex_ecdhe_ecp(SSL *s, SESS_CERT *sc, CBB *cbb)
 	}
 	if ((key = malloc(key_size)) == NULL) {
 		SSLerror(s, ERR_R_MALLOC_FAILURE);
+		goto err;
 	}
 	key_len = ECDH_compute_key(key, key_size, point, ecdh, NULL);
 	if (key_len <= 0) {

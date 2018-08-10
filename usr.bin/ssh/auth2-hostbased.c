@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2-hostbased.c,v 1.32 2017/12/18 02:25:15 djm Exp $ */
+/* $OpenBSD: auth2-hostbased.c,v 1.36 2018/07/31 03:10:27 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  *
@@ -33,7 +33,7 @@
 #include "xmalloc.h"
 #include "ssh2.h"
 #include "packet.h"
-#include "buffer.h"
+#include "sshbuf.h"
 #include "log.h"
 #include "misc.h"
 #include "servconf.h"
@@ -61,15 +61,11 @@ userauth_hostbased(struct ssh *ssh)
 	Authctxt *authctxt = ssh->authctxt;
 	struct sshbuf *b;
 	struct sshkey *key = NULL;
-	char *pkalg, *cuser, *chost, *service;
+	char *pkalg, *cuser, *chost;
 	u_char *pkblob, *sig;
 	size_t alen, blen, slen;
 	int r, pktype, authenticated = 0;
 
-	if (!authctxt->valid) {
-		debug2("%s: disabled because of invalid user", __func__);
-		return 0;
-	}
 	/* XXX use sshkey_froms() */
 	if ((r = sshpkt_get_cstring(ssh, &pkalg, &alen)) != 0 ||
 	    (r = sshpkt_get_string(ssh, &pkblob, &blen)) != 0 ||
@@ -110,22 +106,24 @@ userauth_hostbased(struct ssh *ssh)
 		    "signature format");
 		goto done;
 	}
-	if (match_pattern_list(sshkey_ssh_name(key),
-	    options.hostbased_key_types, 0) != 1) {
+	if (match_pattern_list(pkalg, options.hostbased_key_types, 0) != 1) {
 		logit("%s: key type %s not in HostbasedAcceptedKeyTypes",
 		    __func__, sshkey_type(key));
 		goto done;
 	}
 
-	service = ssh->compat & SSH_BUG_HBSERVICE ? "ssh-userauth" :
-	    authctxt->service;
+	if (!authctxt->valid || authctxt->user == NULL) {
+		debug2("%s: disabled because of invalid user", __func__);
+		goto done;
+	}
+
 	if ((b = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new failed", __func__);
 	/* reconstruct packet */
 	if ((r = sshbuf_put_string(b, session_id2, session_id2_len)) != 0 ||
 	    (r = sshbuf_put_u8(b, SSH2_MSG_USERAUTH_REQUEST)) != 0 ||
 	    (r = sshbuf_put_cstring(b, authctxt->user)) != 0 ||
-	    (r = sshbuf_put_cstring(b, service)) != 0 ||
+	    (r = sshbuf_put_cstring(b, authctxt->service)) != 0 ||
 	    (r = sshbuf_put_cstring(b, "hostbased")) != 0 ||
 	    (r = sshbuf_put_string(b, pkalg, alen)) != 0 ||
 	    (r = sshbuf_put_string(b, pkblob, blen)) != 0 ||

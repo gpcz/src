@@ -1,4 +1,4 @@
-/*	$OpenBSD: octcit.c,v 1.4 2017/12/27 13:16:53 visa Exp $	*/
+/*	$OpenBSD: octcit.c,v 1.6 2018/02/24 11:42:31 visa Exp $	*/
 
 /*
  * Copyright (c) 2017 Visa Hankala
@@ -404,10 +404,7 @@ octcit_intr(uint32_t hwpend, struct trapframe *frame)
 	if (!ISSET(destpp, CIU3_DEST_PP_INT_INTR))
 		goto spurious;
 
-	__asm__ (".set noreorder\n");
 	ipl = ci->ci_ipl;
-	mips_sync();
-	__asm__ (".set reorder\n");
 
 	intsn = (destpp & CIU3_DEST_PP_INT_INTSN) >>
 	    CIU3_DEST_PP_INT_INTSN_SHIFT;
@@ -431,7 +428,7 @@ octcit_intr(uint32_t hwpend, struct trapframe *frame)
 		if (ISSET(ih->ih_flags, IH_MPSAFE))
 			need_lock = 0;
 		else
-			need_lock = ih->ih_level < IPL_CLOCK;
+			need_lock = 1;
 		if (need_lock)
 			__mp_lock(&kernel_lock);
 #endif
@@ -458,10 +455,7 @@ octcit_intr(uint32_t hwpend, struct trapframe *frame)
 			break;
 	}
 
-	__asm__ (".set noreorder\n");
 	ci->ci_ipl = ipl;
-	mips_sync();
-	__asm__ (".set reorder\n");
 
 spurious:
 	if (handled == 0)
@@ -478,11 +472,7 @@ octcit_splx(int newipl)
 	struct cpu_info *ci = curcpu();
 	unsigned int core = ci->ci_cpuid;
 
-	/* Update IPL. Order highly important! */
-	__asm__ (".set noreorder\n");
 	ci->ci_ipl = newipl;
-	mips_sync();
-	__asm__ (".set reorder\n");
 
 	if (newipl < sc->sc_minipl[ci->ci_cpuid])
 		CIU3_WR_8(sc, CIU3_IDT_PP(CIU3_IDT(core, 0)), 1ul << core);

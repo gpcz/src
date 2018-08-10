@@ -1,4 +1,4 @@
-/*	$OpenBSD: rkpcie.c,v 1.1 2018/01/02 22:33:17 kettenis Exp $	*/
+/*	$OpenBSD: rkpcie.c,v 1.5 2018/08/06 10:52:30 patrick Exp $	*/
 /*
  * Copyright (c) 2018 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -63,6 +63,8 @@
 #define  PCIE_LM_RCBARPIS		(1 << 20)
 
 #define PCIE_RC_BASE			0xa00000
+#define PCIE_RC_PCIE_LCAP		(PCIE_RC_BASE + 0x0cc)
+#define  PCIE_RC_PCIE_LCAP_APMS_L0S	(1 << 10)
 
 #define PCIE_ATR_BASE			0xc00000
 #define PCIE_ATR_OB_ADDR0(i)		(PCIE_ATR_BASE + 0x000 + (i) * 0x20)
@@ -77,6 +79,9 @@
 #define  PCIE_ATR_HDR_CFG_TYPE1		0xb
 #define  PCIE_ATR_HDR_RID		(1 << 23)
 
+#define PCIE_ATR_OB_REGION0_SIZE	(32 * 1024 * 1024)
+#define PCIE_ATR_OB_REGION_SIZE		(1 * 1024 * 1024)
+
 #define HREAD4(sc, reg)							\
 	(bus_space_read_4((sc)->sc_iot, (sc)->sc_ioh, (reg)))
 #define HWRITE4(sc, reg, val)						\
@@ -87,6 +92,8 @@ struct rkpcie_softc {
 	bus_space_tag_t		sc_iot;
 	bus_space_handle_t	sc_ioh;
 	bus_space_handle_t	sc_axi_ioh;
+	bus_addr_t		sc_axi_addr;
+	bus_addr_t		sc_apb_addr;
 	int			sc_node;
 	int			sc_phy_node;
 
@@ -94,6 +101,7 @@ struct rkpcie_softc {
 	struct extent		*sc_busex;
 	struct extent		*sc_memex;
 	struct extent		*sc_ioex;
+	int			sc_bus;
 };
 
 int rkpcie_match(struct device *, void *, void *);
@@ -144,6 +152,7 @@ rkpcie_attach(struct device *parent, struct device *self, void *aux)
 	struct fdt_attach_args *faa = aux;
 	struct pcibus_attach_args pba;
 	uint32_t *ep_gpio;
+	uint32_t bus_range[2];
 	uint32_t status;
 	int len, timo;
 
@@ -167,6 +176,8 @@ rkpcie_attach(struct device *parent, struct device *self, void *aux)
 		return;
 	}
 
+	sc->sc_axi_addr = faa->fa_reg[0].addr;
+	sc->sc_apb_addr = faa->fa_reg[1].addr;
 	sc->sc_node = faa->fa_node;
 	printf("\n");
 
@@ -227,8 +238,10 @@ rkpcie_attach(struct device *parent, struct device *self, void *aux)
 			break;
 		delay(1000);
 	}
-	if (timo == 0)
-		printf("timeout\n");
+	if (timo == 0) {
+		printf("%s: link training timeout\n", sc->sc_dev.dv_xname);
+		return;
+	}
 
 	/* Initialize Root Complex registers. */
 	HWRITE4(sc, PCIE_LM_VENDOR_ID, PCI_VENDOR_ROCKCHIP);
@@ -236,6 +249,31 @@ rkpcie_attach(struct device *parent, struct device *self, void *aux)
 	    PCI_CLASS_BRIDGE << PCI_CLASS_SHIFT |
 	    PCI_SUBCLASS_BRIDGE_PCI << PCI_SUBCLASS_SHIFT);
 	HWRITE4(sc, PCIE_LM_RCBAR, PCIE_LM_RCBARPIE | PCIE_LM_RCBARPIS);
+
+	if (OF_getproplen(sc->sc_node, "aspm-no-l0s") == 0) {
+		status = HREAD4(sc, PCIE_RC_PCIE_LCAP);
+		status &= ~PCIE_RC_PCIE_LCAP_APMS_L0S;
+		HWRITE4(sc, PCIE_RC_PCIE_LCAP, status);
+	}
+
+	/* Create extents for our address spaces. */
+	sc->sc_busex = extent_create("pcibus", 0, 255,
+	    M_DEVBUF, NULL, 0, EX_WAITOK | EX_FILLED);
+	sc->sc_memex = extent_create("pcimem", 0, (u_long)-1,
+	    M_DEVBUF, NULL, 0, EX_WAITOK | EX_FILLED);
+	sc->sc_ioex = extent_create("pciio", 0, 0xffffffff,
+	    M_DEVBUF, NULL, 0, EX_WAITOK | EX_FILLED);
+
+	/* Set up bus range. */
+	if (OF_getpropintarray(sc->sc_node, "bus-range", bus_range,
+	    sizeof(bus_range)) != sizeof(bus_range) ||
+	    bus_range[0] >= 32 || bus_range[1] >= 32) {
+		bus_range[0] = 0;
+		bus_range[1] = 31;
+	}
+	sc->sc_bus = bus_range[0];
+	extent_free(sc->sc_busex, bus_range[0],
+	    bus_range[1] - bus_range[0] + 1, EX_WAITOK);
 
 	/* Configure Address Translation. */
 	rkpcie_atr_init(sc);
@@ -267,7 +305,8 @@ rkpcie_attach(struct device *parent, struct device *self, void *aux)
 	pba.pba_memex = sc->sc_memex;
 	pba.pba_ioex = sc->sc_ioex;
 	pba.pba_domain = pci_ndomains++;
-	pba.pba_bus = 0;
+	pba.pba_bus = sc->sc_bus;
+	pba.pba_flags |= PCI_FLAGS_MSI_ENABLED;
 
 	config_found(self, &pba, NULL);
 }
@@ -275,6 +314,12 @@ rkpcie_attach(struct device *parent, struct device *self, void *aux)
 void
 rkpcie_atr_init(struct rkpcie_softc *sc)
 {
+	uint32_t *ranges;
+	struct extent *ex;
+	bus_addr_t addr;
+	bus_size_t size, offset;
+	uint32_t type;
+	int len, region;
 	int i;
 
 	/* Use region 0 to map PCI configuration space. */
@@ -284,36 +329,72 @@ rkpcie_atr_init(struct rkpcie_softc *sc)
 	    PCIE_ATR_HDR_CFG_TYPE0 | PCIE_ATR_HDR_RID);
 	HWRITE4(sc, PCIE_ATR_OB_DESC1(0), 0);
 
-	/* Use region 1-6 to map PCI memory space. */
-	for (i = 1; i < 7; i++) {
-		HWRITE4(sc, PCIE_ATR_OB_ADDR0(i), 32 - 1);
-		HWRITE4(sc, PCIE_ATR_OB_ADDR1(i), 0);
-		HWRITE4(sc, PCIE_ATR_OB_DESC0(i),
-		    PCIE_ATR_HDR_MEM | PCIE_ATR_HDR_RID);
-		HWRITE4(sc, PCIE_ATR_OB_DESC1(i), 0);
-	}
+	len = OF_getproplen(sc->sc_node, "ranges");
+	if (len <= 0 || (len % (7 * sizeof(uint32_t))) != 0)
+		goto fail;
+	ranges = malloc(len, M_TEMP, M_WAITOK);
+	OF_getpropintarray(sc->sc_node, "ranges", ranges, len);
 
-	/* Use region 7 to map PCI IO space. */
-	HWRITE4(sc, PCIE_ATR_OB_ADDR0(7), 32 - 1);
-	HWRITE4(sc, PCIE_ATR_OB_ADDR1(7), 0);
-	HWRITE4(sc, PCIE_ATR_OB_DESC0(7),
-	    PCIE_ATR_HDR_IO | PCIE_ATR_HDR_RID);
-	HWRITE4(sc, PCIE_ATR_OB_DESC1(7), 0);
+	for (i = 0; i < len / sizeof(uint32_t); i += 7) {
+		/* Handle IO and MMIO. */
+		switch (ranges[i] & 0x03000000) {
+		case 0x01000000:
+			type = PCIE_ATR_HDR_IO;
+			ex = sc->sc_ioex;
+			break;
+		case 0x02000000:
+		case 0x03000000:
+			type = PCIE_ATR_HDR_MEM;
+			ex = sc->sc_memex;
+			break;
+		default:
+			continue;
+		}
+
+		/* Only support identity mappings. */
+		if (ranges[i + 1] != ranges[i + 3] ||
+		    ranges[i + 2] != ranges[i + 4])
+			goto fail;
+
+		/* Only support mappings aligned on a region boundary. */
+		addr = ((uint64_t)ranges[i + 1] << 32) + ranges[i + 2];
+		if (addr & (PCIE_ATR_OB_REGION_SIZE - 1))
+			goto fail;
+
+		/* Mappings should lie between AXI and APB regions. */
+		size = ranges[i + 6];
+		if (addr < sc->sc_axi_addr + PCIE_ATR_OB_REGION0_SIZE)
+			goto fail;
+		if (addr + size > sc->sc_apb_addr)
+			goto fail;
+
+		offset = addr - sc->sc_axi_addr - PCIE_ATR_OB_REGION0_SIZE;
+		region = 1 + (offset / PCIE_ATR_OB_REGION_SIZE);
+		while (size > 0) {
+			HWRITE4(sc, PCIE_ATR_OB_ADDR0(region), 32 - 1);
+			HWRITE4(sc, PCIE_ATR_OB_ADDR1(region), 0);
+			HWRITE4(sc, PCIE_ATR_OB_DESC0(region),
+			    type | PCIE_ATR_HDR_RID);
+			HWRITE4(sc, PCIE_ATR_OB_DESC1(region), 0);
+
+			extent_free(ex, addr, PCIE_ATR_OB_REGION_SIZE,
+			    EX_WAITOK);
+			addr += PCIE_ATR_OB_REGION_SIZE;
+			size -= PCIE_ATR_OB_REGION_SIZE;
+			region++;
+		}
+	}
 
 	/* Passthrought inbound translations unmodified. */
 	HWRITE4(sc, PCIE_ATR_IB_ADDR0(2), 32 - 1);
 	HWRITE4(sc, PCIE_ATR_IB_ADDR1(2), 0);
 
-	/* Create extents matching the translations set up above. */
-	sc->sc_busex = extent_create("pcibus", 0, 255,
-	    M_DEVBUF, NULL, 0, EX_WAITOK | EX_FILLED);
-	extent_free(sc->sc_busex, 0, 2, EX_WAITOK);
-	sc->sc_memex = extent_create("pcimem", 0, (u_long)-1,
-	    M_DEVBUF, NULL, 0, EX_WAITOK | EX_FILLED);
-	extent_free(sc->sc_memex, 0xfa000000, 0x600000, EX_WAITOK);
-	sc->sc_ioex = extent_create("pciio", 0, 0xffffffff,
-	    M_DEVBUF, NULL, 0, EX_WAITOK | EX_FILLED);
-	extent_free(sc->sc_ioex, 0xfa600000, 0x100000, EX_WAITOK);
+	free(ranges, M_TEMP, len);
+	return;
+
+fail:
+	printf("%s: can't map ranges\n", sc->sc_dev.dv_xname);
+	free(ranges, M_TEMP, len);
 }
 
 void
@@ -323,9 +404,13 @@ rkpcie_attach_hook(struct device *parent, struct device *self,
 }
 
 int
-rkpcie_bus_maxdevs(void *v, int busno)
+rkpcie_bus_maxdevs(void *v, int bus)
 {
-	return 1;
+	struct rkpcie_softc *sc = v;
+
+	if (bus == sc->sc_bus || bus == sc->sc_bus + 1)
+		return 1;
+	return 32;
 }
 
 pcitag_t
@@ -359,12 +444,16 @@ rkpcie_conf_read(void *v, pcitag_t tag, int reg)
 	int bus, dev, fn;
 
 	rkpcie_decompose_tag(sc, tag, &bus, &dev, &fn);
-	if (bus == 0 && dev == 0)
+	if (bus == sc->sc_bus) {
+		KASSERT(dev == 0);
 		return HREAD4(sc, PCIE_RC_NORMAL_BASE + tag | reg);
-	if (bus != 1)
-		return 0xffffffff;
-
-	return bus_space_read_4(sc->sc_iot, sc->sc_axi_ioh, tag | reg);
+	}
+	if (bus == sc->sc_bus + 1) {
+		KASSERT(dev == 0);
+		return bus_space_read_4(sc->sc_iot, sc->sc_axi_ioh, tag | reg);
+	}
+	
+	return 0xffffffff;
 }
 
 void
@@ -374,18 +463,23 @@ rkpcie_conf_write(void *v, pcitag_t tag, int reg, pcireg_t data)
 	int bus, dev, fn;
 
 	rkpcie_decompose_tag(sc, tag, &bus, &dev, &fn);
-	if (bus == 0 && dev == 0)
+	if (bus == sc->sc_bus) {
+		KASSERT(dev == 0);
 		HWRITE4(sc, PCIE_RC_NORMAL_BASE + tag | reg, data);
-	if (bus != 1)
 		return;
-
-	bus_space_write_4(sc->sc_iot, sc->sc_axi_ioh, tag | reg, data);
+	}
+	if (bus == sc->sc_bus + 1) {
+		KASSERT(dev == 0);
+		bus_space_write_4(sc->sc_iot, sc->sc_axi_ioh, tag | reg, data);
+		return;
+	}
 }
 
 struct rkpcie_intr_handle {
 	pci_chipset_tag_t	ih_pc;
 	pcitag_t		ih_tag;
 	int			ih_intrpin;
+	int			ih_msi;
 };
 
 int
@@ -404,6 +498,7 @@ rkpcie_intr_map(struct pci_attach_args *pa, pci_intr_handle_t *ihp)
 	ih->ih_pc = pa->pa_pc;
 	ih->ih_tag = pa->pa_intrtag;
 	ih->ih_intrpin = pa->pa_intrpin;
+	ih->ih_msi = 0;
 	*ihp = (pci_intr_handle_t)ih;
 
 	return 0;
@@ -414,11 +509,20 @@ rkpcie_intr_map_msi(struct pci_attach_args *pa, pci_intr_handle_t *ihp)
 {
 	pci_chipset_tag_t pc = pa->pa_pc;
 	pcitag_t tag = pa->pa_tag;
+	struct rkpcie_intr_handle *ih;
 
-	if (pci_get_capability(pc, tag, PCI_CAP_MSI, NULL, NULL) == 0)
+	if ((pa->pa_flags & PCI_FLAGS_MSI_ENABLED) == 0 ||
+	    pci_get_capability(pc, tag, PCI_CAP_MSI, NULL, NULL) == 0)
 		return -1;
 
-	return -1;
+	ih = malloc(sizeof(struct rkpcie_intr_handle), M_DEVBUF, M_WAITOK);
+	ih->ih_pc = pa->pa_pc;
+	ih->ih_tag = pa->pa_tag;
+	ih->ih_intrpin = pa->pa_intrpin;
+	ih->ih_msi = 1;
+	*ihp = (pci_intr_handle_t)ih;
+
+	return 0;
 }
 
 int
@@ -429,24 +533,69 @@ rkpcie_intr_map_msix(struct pci_attach_args *pa, int vec,
 }
 
 const char *
-rkpcie_intr_string(void *v, pci_intr_handle_t ih)
+rkpcie_intr_string(void *v, pci_intr_handle_t ihp)
 {
+	struct rkpcie_intr_handle *ih = (struct rkpcie_intr_handle *)ihp;
+
+	if (ih->ih_msi)
+		return "msi";
+
 	return "intx";
 }
 
 void *
-rkpcie_intr_establish(void *v, pci_intr_handle_t ih, int level,
+rkpcie_intr_establish(void *v, pci_intr_handle_t ihp, int level,
     int (*func)(void *), void *arg, char *name)
 {
 	struct rkpcie_softc *sc = v;
+	struct rkpcie_intr_handle *ih = (struct rkpcie_intr_handle *)ihp;
+	void *cookie;
 
-	/* Unmask legacy interrupts. */
-	HWRITE4(sc, PCIE_CLIENT_INT_MASK,
-	    PCIE_CLIENT_INTA_UNMASK | PCIE_CLIENT_INTB_UNMASK |
-	    PCIE_CLIENT_INTC_UNMASK | PCIE_CLIENT_INTD_UNMASK);
+	if (ih->ih_msi) {
+		uint64_t addr, data;
+		pcireg_t reg;
+		int off;
 
-	return arm_intr_establish_fdt_idx(sc->sc_node, 1, level,
-	    func, arg, name);
+		/* Assume hardware passes Requester ID as sideband data. */
+		data = pci_requester_id(ih->ih_pc, ih->ih_tag);
+		cookie = fdt_intr_establish_msi(sc->sc_node, &addr,
+		    &data, level, func, arg, name);
+		if (cookie == NULL)
+			return NULL;
+
+		/* TODO: translate address to the PCI device's view */
+
+		if (pci_get_capability(ih->ih_pc, ih->ih_tag, PCI_CAP_MSI,
+		    &off, &reg) == 0)
+			panic("%s: no msi capability", __func__);
+
+		if (reg & PCI_MSI_MC_C64) {
+			pci_conf_write(ih->ih_pc, ih->ih_tag,
+			    off + PCI_MSI_MA, addr);
+			pci_conf_write(ih->ih_pc, ih->ih_tag,
+			    off + PCI_MSI_MAU32, addr >> 32);
+			pci_conf_write(ih->ih_pc, ih->ih_tag,
+			    off + PCI_MSI_MD64, data);
+		} else {
+			pci_conf_write(ih->ih_pc, ih->ih_tag,
+			    off + PCI_MSI_MA, addr);
+			pci_conf_write(ih->ih_pc, ih->ih_tag,
+			    off + PCI_MSI_MD32, data);
+		}
+		pci_conf_write(ih->ih_pc, ih->ih_tag,
+		    off, reg | PCI_MSI_MC_MSIE);
+	} else {
+		/* Unmask legacy interrupts. */
+		HWRITE4(sc, PCIE_CLIENT_INT_MASK,
+		    PCIE_CLIENT_INTA_UNMASK | PCIE_CLIENT_INTB_UNMASK |
+		    PCIE_CLIENT_INTC_UNMASK | PCIE_CLIENT_INTD_UNMASK);
+
+		cookie = fdt_intr_establish_idx(sc->sc_node, 1, level,
+		    func, arg, name);
+	}
+
+	free(ih, M_DEVBUF, sizeof(struct rkpcie_intr_handle));
+	return cookie;
 }
 
 void
@@ -481,13 +630,14 @@ rkpcie_intr_disestablish(void *v, void *cookie)
 void
 rkpcie_phy_init(struct rkpcie_softc *sc)
 {
-	uint32_t phy;
+	uint32_t phys[8];
+	int len;
 
-	phy = OF_getpropint(sc->sc_node, "phys", 0);
-	if (phy == 0)
+	len = OF_getpropintarray(sc->sc_node, "phys", phys, sizeof(phys));
+	if (len < sizeof(phys[0]))
 		return;
 
-	sc->sc_phy_node = OF_getnodebyphandle(phy);
+	sc->sc_phy_node = OF_getnodebyphandle(phys[0]);
 	if (sc->sc_phy_node == 0)
 		return;
 

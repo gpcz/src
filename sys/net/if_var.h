@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_var.h,v 1.86 2018/01/02 12:52:17 mpi Exp $	*/
+/*	$OpenBSD: if_var.h,v 1.89 2018/01/10 23:50:39 dlg Exp $	*/
 /*	$NetBSD: if.h,v 1.23 1996/05/07 02:40:27 thorpej Exp $	*/
 
 /*
@@ -44,6 +44,7 @@
 #include <sys/refcnt.h>
 #include <sys/task.h>
 #include <sys/time.h>
+#include <sys/timeout.h>
 
 #include <net/ifq.h>
 
@@ -73,7 +74,6 @@
  */
 
 struct rtentry;
-struct timeout;
 struct ifnet;
 struct task;
 
@@ -90,7 +90,14 @@ struct if_clone {
 };
 
 #define	IF_CLONE_INITIALIZER(name, create, destroy)			\
-	{ { 0 }, name, sizeof(name) - 1, create, destroy }
+{									\
+  .ifc_list	= { NULL, NULL },					\
+  .ifc_name	= name,							\
+  .ifc_namelen	= sizeof(name) - 1,					\
+  .ifc_create	= create,						\
+  .ifc_destroy	= destroy,						\
+}
+
 /*
  *  Locks used to protect struct members in this file:
  *	I	immutable after creation
@@ -127,7 +134,7 @@ struct ifnet {				/* and the entries */
 	caddr_t if_mcast6;		/* used by IPv6 multicast code */
 	caddr_t	if_pf_kif;		/* pf interface abstraction */
 	union {
-		caddr_t	carp_s;		/* carp structure (used by !carp ifs) */
+		struct srpl carp_s;	/* carp if list (used by !carp ifs) */
 		struct ifnet *carp_d;	/* ptr to carpdev (used by carp ifs) */
 	} if_carp_ptr;
 #define if_carp		if_carp_ptr.carp_s
@@ -142,9 +149,9 @@ struct ifnet {				/* and the entries */
 	u_short	if_rtlabelid;		/* [c] next route label */
 	uint8_t if_priority;		/* [c] route priority offset */
 	uint8_t if_llprio;		/* [N] link layer priority */
-	struct	timeout *if_slowtimo;	/* [I] watchdog timeout */
-	struct	task *if_watchdogtask;	/* [I] watchdog task */
-	struct	task *if_linkstatetask; /* [I] task to do route updates */
+	struct	timeout if_slowtimo;	/* [I] watchdog timeout */
+	struct	task if_watchdogtask;	/* [I] watchdog task */
+	struct	task if_linkstatetask;	/* [I] task to do route updates */
 
 	/* procedure handles */
 	SRPL_HEAD(, ifih) if_inputs;	/* input routines (dequeue) */

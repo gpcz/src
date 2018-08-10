@@ -1,4 +1,4 @@
-.\" $OpenBSD: bgpd.conf.5,v 1.163 2017/08/12 17:39:51 job Exp $
+.\" $OpenBSD: bgpd.conf.5,v 1.171 2018/07/11 14:08:46 benno Exp $
 .\"
 .\" Copyright (c) 2004 Claudio Jeker <claudio@openbsd.org>
 .\" Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -16,7 +16,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: August 12 2017 $
+.Dd $Mdocdate: July 11 2018 $
 .Dt BGPD.CONF 5
 .Os
 .Sh NAME
@@ -27,10 +27,10 @@ The
 .Xr bgpd 8
 daemon implements the Border Gateway Protocol version 4 as described
 in RFC 4271.
-.Sh SECTIONS
+.Pp
 The
 .Nm
-config file is divided into five main sections.
+config file is divided into the following main sections:
 .Bl -tag -width xxxx
 .It Sy Macros
 User-defined variables may be defined and used later, simplifying the
@@ -273,6 +273,17 @@ Log received and sent updates.
 .Pq Ic inet Ns | Ns Ic inet6
 .Ic rtlabel Ar label Op Ic set ...\&
 .Xc
+.It Xo
+.Ic network
+.Pq Ic inet Ns | Ns Ic inet6
+.Ic priority Ar number Op Ic set ...\&
+.Xc
+.\" NOT IMPLEMENTED. DO WE WANT THIS?
+.\" .It Xo
+.\" .Ic network prefix-set
+.\" .Ar name
+.\" .Op Ic set ...\&
+.\" .Xc
 Announce the specified network as belonging to our AS.
 If set to
 .Ic connected ,
@@ -284,6 +295,11 @@ If set to
 .Ic rtlabel ,
 routes with the specified
 .Ar label
+will be announced.
+If set to
+.Ic priority ,
+routes with the specified
+.Ar priority
 will be announced.
 .Bd -literal -offset indent
 network 192.168.7.0/24
@@ -318,6 +334,42 @@ bgpd may use the default route to verify nexthops.
 By default bgpd will only use static routes or routes added by other routing
 daemons like
 .Xr ospfd 8 .
+.Pp
+.It Xo
+.Ic prefix-set Ar name
+.Ic { Ar address Ns Li / Ns Ar len ... Ic }
+.Xc
+A
+.Ic prefix-set
+holds a collection of prefixes and can be used in place
+of the
+.Ic prefix
+parameter in
+.Sx FILTER
+rules.
+.\" XXX not implemented
+.\" and
+.\".Ic network
+.\" statements.
+Lookups against prefix-sets are more efficient than a large number of rules
+which differ only in prefix.
+.Pp
+A prefix can be followed by the prefixlen operators listed for the
+.Ic prefix
+parameter in the
+.Sx PARAMETERS
+section.
+.Pp
+The first example creates a set of prefixes called
+.Dq private ,
+to hold a number of RFC 1918 private network blocks.
+The second example shows the use of prefixlen operators.
+.Bd -literal -offset indent
+prefix-set private { 10.0.0.0/8, 172.16.0.0/12,
+			192.168.0.0/16, fc00::/7 }
+prefix-set as64496set { 192.0.2.0/24 prefixlen >= 26,
+			2001:db8::/32 or-longer }
+.Ed
 .Pp
 .It Xo
 .Ic rde
@@ -596,38 +648,20 @@ There are several neighbor properties:
 .Bl -tag -width Ds -compact
 .It Xo
 .Ic announce
-.Sm off
-.Pq Ic all | none | self | default-route
-.Sm on
+.Pq Ic all | default-route | none
 .Xc
-If set to
-.Ic none ,
-no
-.Em UPDATE
-messages will be sent to the neighbor.
-If set to
-.Ic default-route ,
-only the default route will be announced to the neighbor.
-If set to
-.Ic all ,
-all generated
-.Em UPDATE
-messages will be sent to the neighbor.
-This is usually used for
-.Em transit AS's
+.Ic announce all
+is a no-op.
+.Ic announce none
 and
-.Em IBGP
-peers.
-The default value
-for
-.Em EBGP
-peers is
-.Ic self ,
-which limits the sent
-.Em UPDATE
-messages to announcements of the local AS.
-The default for IBGP peers is
-.Ic all .
+.Ic announce default-route
+are aliases for
+.Ic export none
+and
+.Ic export default-route ,
+respectively.
+These three directives are provided for backward compatibility, but will
+eventually be removed.
 .Pp
 .It Xo
 .Ic announce
@@ -806,6 +840,21 @@ The default value for IBGP peers is
 .Ic no
 otherwise the default is
 .Ic yes .
+.Pp
+.It Xo
+.Ic export
+.Sm off
+.Pq Ic none | default-route
+.Sm on
+.Xc
+If set to
+.Ic none ,
+no
+.Em UPDATE
+messages will be sent to the neighbor.
+If set to
+.Ic default-route ,
+only the default route will be announced to the neighbor.
 .Pp
 .It Ic holdtime Ar seconds
 Set the holdtime in seconds.
@@ -1035,6 +1084,7 @@ The last matching
 or
 .Ic deny
 rule decides what action is taken.
+The default action is to deny.
 .Pp
 The following actions can be used in the filter:
 .Bl -tag -width xxxxxxxx
@@ -1374,6 +1424,12 @@ is a shorthand for:
 .Bd -literal -offset indent
 .Ic prefix Ar address Ns Li / Ns Ar len Ic prexiflen Ic >= Ar len
 .Ed
+.Pp
+.It Ic prefix-set Ar name
+This rule applies only to
+.Em UPDATES
+that match the given prefix-set
+.Ar name .
 .Pp
 .It Ic quick
 If an

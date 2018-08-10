@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.78 2017/11/02 18:27:35 nicm Exp $ */
+/* $OpenBSD: session.c,v 1.80 2018/08/02 11:56:12 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -29,7 +29,7 @@
 
 struct sessions		sessions;
 static u_int		next_session_id;
-struct session_groups	session_groups;
+struct session_groups	session_groups = RB_INITIALIZER(&session_groups);
 
 static void	session_free(int, short, void *);
 
@@ -41,21 +41,19 @@ static struct winlink *session_previous_alert(struct winlink *);
 static void	session_group_remove(struct session *);
 static void	session_group_synchronize1(struct session *, struct session *);
 
-RB_GENERATE(sessions, session, entry, session_cmp);
-
 int
 session_cmp(struct session *s1, struct session *s2)
 {
 	return (strcmp(s1->name, s2->name));
 }
+RB_GENERATE(sessions, session, entry, session_cmp);
 
-RB_GENERATE(session_groups, session_group, entry, session_group_cmp);
-
-int
+static int
 session_group_cmp(struct session_group *s1, struct session_group *s2)
 {
 	return (strcmp(s1->name, s2->name));
 }
+RB_GENERATE_STATIC(session_groups, session_group, entry, session_group_cmp);
 
 /*
  * Find if session is still alive. This is true if it is still on the global
@@ -291,9 +289,10 @@ session_update_activity(struct session *s, struct timeval *from)
 	else
 		memcpy(&s->activity_time, from, sizeof s->activity_time);
 
-	log_debug("session %s activity %lld.%06d (last %lld.%06d)", s->name,
-	    (long long)s->activity_time.tv_sec, (int)s->activity_time.tv_usec,
-	    (long long)last->tv_sec, (int)last->tv_usec);
+	log_debug("session $%u %s activity %lld.%06d (last %lld.%06d)", s->id,
+	    s->name, (long long)s->activity_time.tv_sec,
+	    (int)s->activity_time.tv_usec, (long long)last->tv_sec,
+	    (int)last->tv_usec);
 
 	if (evtimer_initialized(&s->lock_timer))
 		evtimer_del(&s->lock_timer);

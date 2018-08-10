@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_mmap.c,v 1.144 2018/01/02 06:38:45 guenther Exp $	*/
+/*	$OpenBSD: uvm_mmap.c,v 1.150 2018/04/27 10:13:37 mpi Exp $	*/
 /*	$NetBSD: uvm_mmap.c,v 1.49 2001/02/18 21:19:08 chs Exp $	*/
 
 /*
@@ -326,15 +326,11 @@ uvm_wxcheck(struct proc *p, char *call)
 	if (pr->ps_wxcounter++ == 0)
 		log(LOG_NOTICE, "%s(%d): %s W^X violation\n",
 		    pr->ps_comm, pr->ps_pid, call);
-	if (uvm_wxabort) {
-		struct sigaction sa;
 
-		/* Send uncatchable SIGABRT for coredump */
-		memset(&sa, 0, sizeof sa);
-		sa.sa_handler = SIG_DFL;
-		setsigvec(p, SIGABRT, &sa);
-		psignal(p, SIGABRT);
-	}
+	/* Send uncatchable SIGABRT for coredump */
+	if (uvm_wxabort)
+		sigexit(p, SIGABRT);
+
 	return (ENOTSUP);
 }
 
@@ -393,6 +389,16 @@ sys_mmap(struct proc *p, void *v, register_t *retval)
 		return (EINVAL);
 	if ((flags & (MAP_FIXED|__MAP_NOREPLACE)) == __MAP_NOREPLACE)
 		return (EINVAL);
+	if (flags & MAP_STACK) {
+		if ((flags & (MAP_ANON|MAP_PRIVATE)) != (MAP_ANON|MAP_PRIVATE))
+			return (EINVAL);
+		if (flags & ~(MAP_STACK|MAP_FIXED|MAP_ANON|MAP_PRIVATE))
+			return (EINVAL);
+		if (pos != 0)
+			return (EINVAL);
+		if ((prot & (PROT_READ|PROT_WRITE)) != (PROT_READ|PROT_WRITE))
+			return (EINVAL);
+	}
 	if (size == 0)
 		return (EINVAL);
 
@@ -427,8 +433,6 @@ sys_mmap(struct proc *p, void *v, register_t *retval)
 			KERNEL_UNLOCK();
 			return (EBADF);
 		}
-
-		FREF(fp);
 
 		if (fp->f_type != DTYPE_VNODE) {
 			error = ENODEV;		/* only mmap vnodes! */
@@ -670,7 +674,6 @@ sys_munmap(struct proc *p, void *v, register_t *retval)
 
 	TAILQ_INIT(&dead_entries);
 	uvm_unmap_remove(map, addr, addr + size, &dead_entries, FALSE, TRUE);
-
 	vm_map_unlock(map);	/* and unlock */
 
 	uvm_unmap_detach(&dead_entries, 0);
@@ -872,7 +875,7 @@ sys_mlock(struct proc *p, void *v, register_t *retval)
 			p->p_rlimit[RLIMIT_MEMLOCK].rlim_cur)
 		return (EAGAIN);
 #else
-	if ((error = suser(p, 0)) != 0)
+	if ((error = suser(p)) != 0)
 		return (error);
 #endif
 
@@ -906,7 +909,7 @@ sys_munlock(struct proc *p, void *v, register_t *retval)
 		return (EINVAL);		/* disallow wrap-around. */
 
 #ifndef pmap_wired_count
-	if ((error = suser(p, 0)) != 0)
+	if ((error = suser(p)) != 0)
 		return (error);
 #endif
 
@@ -933,7 +936,7 @@ sys_mlockall(struct proc *p, void *v, register_t *retval)
 		return (EINVAL);
 
 #ifndef pmap_wired_count
-	if ((error = suser(p, 0)) != 0)
+	if ((error = suser(p)) != 0)
 		return (error);
 #endif
 
@@ -1048,6 +1051,8 @@ uvm_mmapanon(vm_map_t map, vaddr_t *addr, vsize_t size, vm_prot_t prot,
 	else
 		/* shared: create amap now */
 		uvmflag |= UVM_FLAG_OVERLAY;
+	if (flags & MAP_STACK)
+		uvmflag |= UVM_FLAG_STACK;
 
 	/* set up mapping flags */
 	uvmflag = UVM_MAPFLAG(prot, maxprot,
@@ -1154,6 +1159,8 @@ uvm_mmapfile(vm_map_t map, vaddr_t *addr, vsize_t size, vm_prot_t prot,
 		uvmflag |= UVM_FLAG_COPYONW;
 	if (flags & __MAP_NOFAULT)
 		uvmflag |= (UVM_FLAG_NOFAULT | UVM_FLAG_OVERLAY);
+	if (flags & MAP_STACK)
+		uvmflag |= UVM_FLAG_STACK;
 
 	/* set up mapping flags */
 	uvmflag = UVM_MAPFLAG(prot, maxprot,

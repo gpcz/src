@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_proto.c,v 1.81 2017/12/08 21:16:01 stsp Exp $	*/
+/*	$OpenBSD: ieee80211_proto.c,v 1.88 2018/08/06 14:28:13 stsp Exp $	*/
 /*	$NetBSD: ieee80211_proto.c,v 1.8 2004/04/30 23:58:20 dyoung Exp $	*/
 
 /*-
@@ -557,7 +557,7 @@ ieee80211_ht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
 	 * Require at least one of the mandatory MCS.
 	 * MCS 0-7 are mandatory but some APs have particular MCS disabled.
 	 */
-	if ((ni->ni_rxmcs[0] & 0xff) == 0) {
+	if (!ieee80211_node_supports_ht(ni)) {
 		ic->ic_stats.is_ht_nego_no_mandatory_mcs++;
 		return;
 	}
@@ -715,6 +715,24 @@ ieee80211_delba_request(struct ieee80211com *ic, struct ieee80211_node *ni,
 	}
 }
 
+#ifndef IEEE80211_STA_ONLY
+void
+ieee80211_auth_open_confirm(struct ieee80211com *ic,
+    struct ieee80211_node *ni, uint16_t seq)
+{
+	struct ifnet *ifp = &ic->ic_if;
+
+	IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_AUTH, seq + 1);
+	if (ifp->if_flags & IFF_DEBUG)
+		printf("%s: station %s %s authenticated (open)\n",
+		    ifp->if_xname,
+		    ether_sprintf((u_int8_t *)ni->ni_macaddr),
+		    ni->ni_state != IEEE80211_STA_CACHE ?
+		    "newly" : "already");
+	ieee80211_node_newstate(ni, IEEE80211_STA_AUTH);
+}
+#endif
+
 void
 ieee80211_auth_open(struct ieee80211com *ic, const struct ieee80211_frame *wh,
     struct ieee80211_node *ni, struct ieee80211_rxinfo *rxi, u_int16_t seq,
@@ -765,15 +783,16 @@ ieee80211_auth_open(struct ieee80211com *ic, const struct ieee80211_frame *wh,
 			ni->ni_rstamp = rxi->rxi_tstamp;
 			ni->ni_chan = ic->ic_bss->ni_chan;
 		}
-		IEEE80211_SEND_MGMT(ic, ni,
-			IEEE80211_FC0_SUBTYPE_AUTH, seq + 1);
-		if (ifp->if_flags & IFF_DEBUG)
-			printf("%s: station %s %s authenticated (open)\n",
-			    ifp->if_xname,
-			    ether_sprintf((u_int8_t *)ni->ni_macaddr),
-			    ni->ni_state != IEEE80211_STA_CACHE ?
-			    "newly" : "already");
-		ieee80211_node_newstate(ni, IEEE80211_STA_AUTH);
+
+		/* 
+		 * Drivers may want to set up state before confirming.
+		 * In which case this returns EBUSY and the driver will
+		 * later call ieee80211_auth_open_confirm() by itself.
+		 */
+		if (ic->ic_newauth && ic->ic_newauth(ic, ni,
+		    ni->ni_state != IEEE80211_STA_CACHE, seq) != 0)
+			break;
+		ieee80211_auth_open_confirm(ic, ni, seq);
 		break;
 #endif	/* IEEE80211_STA_ONLY */
 
@@ -797,7 +816,7 @@ ieee80211_auth_open(struct ieee80211com *ic, const struct ieee80211_frame *wh,
 		if (status != 0) {
 			if (ifp->if_flags & IFF_DEBUG)
 				printf("%s: open authentication failed "
-				    "(reason %d) for %s\n", ifp->if_xname,
+				    "(status %d) for %s\n", ifp->if_xname,
 				    status,
 				    ether_sprintf((u_int8_t *)wh->i_addr3));
 			if (ni != ic->ic_bss)
@@ -925,11 +944,12 @@ justcleanup:
 			ic->ic_mgt_timer = 0;
 			mq_purge(&ic->ic_mgtq);
 			mq_purge(&ic->ic_pwrsaveq);
-			ieee80211_free_allnodes(ic);
+			ieee80211_free_allnodes(ic, 1);
 			break;
 		}
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
-		ieee80211_crypto_clear_groupkeys(ic);
+		if (ic->ic_flags & IEEE80211_F_RSNON)
+			ieee80211_crypto_clear_groupkeys(ic);
 		break;
 	case IEEE80211_S_SCAN:
 		ic->ic_flags &= ~IEEE80211_F_SIBSS;
@@ -941,7 +961,8 @@ justcleanup:
 		ni->ni_associd = 0;
 		ni->ni_rstamp = 0;
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
-		ieee80211_crypto_clear_groupkeys(ic);
+		if (ic->ic_flags & IEEE80211_F_RSNON)
+			ieee80211_crypto_clear_groupkeys(ic);
 		switch (ostate) {
 		case IEEE80211_S_INIT:
 #ifndef IEEE80211_STA_ONLY
@@ -973,7 +994,7 @@ justcleanup:
 			}
 			timeout_del(&ic->ic_bgscan_timeout);
 			ic->ic_bgscan_fail = 0;
-			ieee80211_free_allnodes(ic);
+			ieee80211_free_allnodes(ic, 1);
 			/* FALLTHROUGH */
 		case IEEE80211_S_AUTH:
 		case IEEE80211_S_ASSOC:
@@ -987,11 +1008,12 @@ justcleanup:
 		break;
 	case IEEE80211_S_AUTH:
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
-		ieee80211_crypto_clear_groupkeys(ic);
+		if (ic->ic_flags & IEEE80211_F_RSNON)
+			ieee80211_crypto_clear_groupkeys(ic);
 		switch (ostate) {
 		case IEEE80211_S_INIT:
 			if (ifp->if_flags & IFF_DEBUG)
-				printf("%s: invalid transition %s -> %s",
+				printf("%s: invalid transition %s -> %s\n",
 				    ifp->if_xname, ieee80211_state_name[ostate],
 				    ieee80211_state_name[nstate]);
 			break;
@@ -1036,7 +1058,7 @@ justcleanup:
 		case IEEE80211_S_SCAN:
 		case IEEE80211_S_ASSOC:
 			if (ifp->if_flags & IFF_DEBUG)
-				printf("%s: invalid transition %s -> %s",
+				printf("%s: invalid transition %s -> %s\n",
 				    ifp->if_xname, ieee80211_state_name[ostate],
 				    ieee80211_state_name[nstate]);
 			break;
@@ -1053,10 +1075,12 @@ justcleanup:
 	case IEEE80211_S_RUN:
 		switch (ostate) {
 		case IEEE80211_S_INIT:
+			if (ic->ic_opmode == IEEE80211_M_MONITOR)
+				break;
 		case IEEE80211_S_AUTH:
 		case IEEE80211_S_RUN:
 			if (ifp->if_flags & IFF_DEBUG)
-				printf("%s: invalid transition %s -> %s",
+				printf("%s: invalid transition %s -> %s\n",
 				    ifp->if_xname, ieee80211_state_name[ostate],
 				    ieee80211_state_name[nstate]);
 			break;

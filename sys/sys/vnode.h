@@ -1,4 +1,4 @@
-/*	$OpenBSD: vnode.h,v 1.142 2017/12/14 20:20:38 deraadt Exp $	*/
+/*	$OpenBSD: vnode.h,v 1.147 2018/07/13 09:25:23 beck Exp $	*/
 /*	$NetBSD: vnode.h,v 1.38 1996/02/29 20:59:05 cgd Exp $	*/
 
 /*
@@ -93,12 +93,14 @@ struct vnode {
 	enum	vtagtype v_tag;			/* type of underlying data */
 	u_int	v_flag;				/* vnode flags (see below) */
 	u_int   v_usecount;			/* reference count of users */
+	u_int   v_uvcount;			/* unveil references */
 	/* reference count of writers */
 	u_int   v_writecount;
 	/* Flags that can be read/written in interrupts */
 	u_int   v_bioflag;
 	u_int   v_holdcnt;			/* buffer references */
 	u_int   v_id;				/* capability identifier */
+	u_int	v_inflight;
 	struct	mount *v_mount;			/* ptr to vfs we are in */
 	TAILQ_ENTRY(vnode) v_freelist;		/* vnode freelist */
 	LIST_ENTRY(vnode) v_mntvnodes;		/* vnodes for mount point */
@@ -513,15 +515,13 @@ int VOP_RECLAIM(struct vnode *, struct proc *);
 struct vop_lock_args {
 	struct vnode *a_vp;
 	int a_flags;
-	struct proc *a_p;
 };
-int VOP_LOCK(struct vnode *, int, struct proc *);
+int VOP_LOCK(struct vnode *, int);
 
 struct vop_unlock_args {
 	struct vnode *a_vp;
-	struct proc *a_p;
 };
-int VOP_UNLOCK(struct vnode *, struct proc *);
+int VOP_UNLOCK(struct vnode *);
 
 struct vop_bmap_args {
 	struct vnode *a_vp;
@@ -592,7 +592,7 @@ int	vcount(struct vnode *);
 int	vfinddev(dev_t, enum vtype, struct vnode **);
 void	vflushbuf(struct vnode *, int);
 int	vflush(struct mount *, struct vnode *, int);
-int	vget(struct vnode *, int, struct proc *);
+int	vget(struct vnode *, int);
 void	vgone(struct vnode *);
 void	vgonel(struct vnode *, struct proc *);
 int	vinvalbuf(struct vnode *, int, struct ucred *, struct proc *,
@@ -634,7 +634,7 @@ int	vn_rdwr(enum uio_rw, struct vnode *, caddr_t, int, off_t,
 	    enum uio_seg, int, struct ucred *, size_t *, struct proc *);
 int	vn_stat(struct vnode *, struct stat *, struct proc *);
 int	vn_statfile(struct file *, struct stat *, struct proc *);
-int	vn_lock(struct vnode *, int, struct proc *);
+int	vn_lock(struct vnode *, int);
 int	vn_writechk(struct vnode *);
 int	vn_fsizechk(struct vnode *, struct uio *, int, ssize_t *);
 int	vn_ioctl(struct file *, u_long, caddr_t, struct proc *);

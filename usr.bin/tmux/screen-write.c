@@ -1,4 +1,4 @@
-/* $OpenBSD: screen-write.c,v 1.135 2017/11/15 19:21:24 nicm Exp $ */
+/* $OpenBSD: screen-write.c,v 1.138 2018/07/31 11:49:26 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -408,7 +408,7 @@ screen_write_fast_copy(struct screen_write_ctx *ctx, struct screen *src,
 			break;
 		cx = s->cx;
 		for (xx = px; xx < px + nx; xx++) {
-			if (xx >= gd->linedata[yy].cellsize)
+			if (xx >= grid_get_line(gd, yy)->cellsize)
 				break;
 			grid_get_cell(gd, xx, yy, &gc);
 			if (xx + gc.data.width > px + nx)
@@ -694,7 +694,7 @@ screen_write_backspace(struct screen_write_ctx *ctx)
 	if (s->cx == 0) {
 		if (s->cy == 0)
 			return;
-		gl = &s->grid->linedata[s->grid->hsize + s->cy - 1];
+		gl = grid_get_line(s->grid, s->grid->hsize + s->cy - 1);
 		if (gl->flags & GRID_LINE_WRAPPED) {
 			s->cy--;
 			s->cx = screen_size_x(s) - 1;
@@ -917,7 +917,7 @@ screen_write_clearline(struct screen_write_ctx *ctx, u_int bg)
 	struct tty_ctx		 ttyctx;
 	u_int			 sx = screen_size_x(s);
 
-	gl = &s->grid->linedata[s->grid->hsize + s->cy];
+	gl = grid_get_line(s->grid, s->grid->hsize + s->cy);
 	if (gl->cellsize == 0 && bg == 8)
 		return;
 
@@ -940,7 +940,7 @@ screen_write_clearendofline(struct screen_write_ctx *ctx, u_int bg)
 	struct tty_ctx		 ttyctx;
 	u_int			 sx = screen_size_x(s);
 
-	gl = &s->grid->linedata[s->grid->hsize + s->cy];
+	gl = grid_get_line(s->grid, s->grid->hsize + s->cy);
 	if (s->cx > sx - 1 || (s->cx >= gl->cellsize && bg == 8))
 		return;
 
@@ -1043,7 +1043,7 @@ screen_write_linefeed(struct screen_write_ctx *ctx, int wrapped, u_int bg)
 	struct grid		*gd = s->grid;
 	struct grid_line	*gl;
 
-	gl = &gd->linedata[gd->hsize + s->cy];
+	gl = grid_get_line(gd, gd->hsize + s->cy);
 	if (wrapped)
 		gl->flags |= GRID_LINE_WRAPPED;
 	else
@@ -1297,10 +1297,12 @@ screen_write_collect_end(struct screen_write_ctx *ctx)
 			grid_view_get_cell(s->grid, xx, s->cy, &gc);
 			if (~gc.flags & GRID_FLAG_PADDING)
 				break;
-			grid_view_set_cell(s->grid, xx, s->cy, &grid_default_cell);
+			grid_view_set_cell(s->grid, xx, s->cy,
+			    &grid_default_cell);
 		}
 		if (gc.data.width > 1)
-			grid_view_set_cell(s->grid, xx, s->cy, &grid_default_cell);
+			grid_view_set_cell(s->grid, xx, s->cy,
+			    &grid_default_cell);
 	}
 
 	memcpy(&gc, &ci->gc, sizeof gc);
@@ -1333,7 +1335,7 @@ screen_write_collect_add(struct screen_write_ctx *ctx,
 	 */
 
 	collect = 1;
-	if (gc->data.width != 1 || gc->data.size != 1)
+	if (gc->data.width != 1 || gc->data.size != 1 || *gc->data.data >= 0x7f)
 		collect = 0;
 	else if (gc->attr & GRID_ATTR_CHARSET)
 		collect = 0;
@@ -1341,7 +1343,7 @@ screen_write_collect_add(struct screen_write_ctx *ctx,
 		collect = 0;
 	else if (s->mode & MODE_INSERT)
 		collect = 0;
-	else if (s->sel.flag)
+	else if (s->sel != NULL)
 		collect = 0;
 	if (!collect) {
 		screen_write_collect_end(ctx);
@@ -1431,7 +1433,7 @@ screen_write_cell(struct screen_write_ctx *ctx, const struct grid_cell *gc)
 	screen_write_initctx(ctx, &ttyctx);
 
 	/* Handle overwriting of UTF-8 characters. */
-	gl = &s->grid->linedata[s->grid->hsize + s->cy];
+	gl = grid_get_line(s->grid, s->grid->hsize + s->cy);
 	if (gl->flags & GRID_LINE_EXTENDED) {
 		grid_view_get_cell(gd, s->cx, s->cy, &now_gc);
 		if (screen_write_overwrite(ctx, &now_gc, width))

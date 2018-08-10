@@ -1,5 +1,5 @@
-/*	$Id: aldap.c,v 1.38 2017/12/21 05:09:56 jmatthew Exp $ */
-/*	$OpenBSD: aldap.c,v 1.38 2017/12/21 05:09:56 jmatthew Exp $ */
+/*	$Id: aldap.c,v 1.42 2018/07/31 11:37:18 rob Exp $ */
+/*	$OpenBSD: aldap.c,v 1.42 2018/07/31 11:37:18 rob Exp $ */
 
 /*
  * Copyright (c) 2008 Alexander Schrijver <aschrijver@openbsd.org>
@@ -47,7 +47,7 @@ int				aldap_create_page_control(struct ber_element *,
 				    int, struct aldap_page_control *);
 int				aldap_send(struct aldap *,
 				    struct ber_element *);
-unsigned long			aldap_application(struct ber_element *);
+unsigned int			aldap_application(struct ber_element *);
 
 #ifdef DEBUG
 void			 ldap_debug_elements(struct ber_element *);
@@ -61,7 +61,7 @@ void			 ldap_debug_elements(struct ber_element *);
 #define LDAP_DEBUG(x, y)	do { } while (0)
 #endif
 
-unsigned long
+unsigned int
 aldap_application(struct ber_element *elm)
 {
 	return BER_TYPE_OCTETSTRING;
@@ -91,7 +91,6 @@ aldap_init(int fd)
 		return NULL;
 	a->buf = evbuffer_new();
 	a->fd = fd;
-	a->ber.fd = -1;
 	ber_set_application(&a->ber, aldap_application);
 
 	return a;
@@ -169,8 +168,7 @@ aldap_req_starttls(struct aldap *ldap)
 		goto fail;
 
 	ber = ber_printf_elements(root, "d{tst", ++ldap->msgid, BER_CLASS_APP,
-	    (unsigned long) LDAP_REQ_EXTENDED, LDAP_STARTTLS_OID,
-	    BER_CLASS_CONTEXT, (unsigned long) 0);
+	    LDAP_REQ_EXTENDED, LDAP_STARTTLS_OID, BER_CLASS_CONTEXT, 0);
 	if (ber == NULL) {
 		ldap->err = ALDAP_ERR_OPERATION_FAILED;
 		goto fail;
@@ -202,8 +200,8 @@ aldap_bind(struct aldap *ldap, char *binddn, char *bindcred)
 		goto fail;
 
 	elm = ber_printf_elements(root, "d{tdsst", ++ldap->msgid, BER_CLASS_APP,
-	    (unsigned long)LDAP_REQ_BIND, VERSION, binddn, bindcred,
-	    BER_CLASS_CONTEXT, (unsigned long)LDAP_AUTH_SIMPLE);
+	    LDAP_REQ_BIND, VERSION, binddn, bindcred,
+	    BER_CLASS_CONTEXT, LDAP_AUTH_SIMPLE);
 	if (elm == NULL)
 		goto fail;
 
@@ -262,7 +260,7 @@ aldap_search(struct aldap *ldap, char *basedn, enum scope scope, char *filter,
 		goto fail;
 
 	ber = ber_printf_elements(root, "d{t", ++ldap->msgid, BER_CLASS_APP,
-	    (unsigned long) LDAP_REQ_SEARCH);
+	    LDAP_REQ_SEARCH);
 	if (ber == NULL) {
 		ldap->err = ALDAP_ERR_OPERATION_FAILED;
 		goto fail;
@@ -318,7 +316,6 @@ aldap_create_page_control(struct ber_element *elm, int size,
 	struct ber_element *ber = NULL;
 
 	c.br_wbuf = NULL;
-	c.fd = -1;
 
 	ber = ber_add_sequence(NULL);
 
@@ -352,7 +349,7 @@ struct aldap_message *
 aldap_parse(struct aldap *ldap)
 {
 	int			 class;
-	unsigned long		 type;
+	unsigned int		 type;
 	long long		 msgid = 0;
 	struct aldap_message	*m;
 	struct ber_element	*a = NULL, *ep;
@@ -462,7 +459,6 @@ aldap_parse_page_control(struct ber_element *control, size_t len)
 	struct aldap_page_control *page;
 
 	b.br_wbuf = NULL;
-	b.fd = -1;
 	ber_scanf_elements(control, "ss", &oid, &encoded);
 	ber_set_readbuf(&b, encoded, control->be_next->be_len);
 	elm = ber_read_elements(&b, NULL);
@@ -696,16 +692,14 @@ aldap_free_attr(char **values)
 	return (1);
 }
 
-#if 0
 void
 aldap_free_url(struct aldap_url *lu)
 {
 	free(lu->buffer);
-	free(lu->filter);
 }
 
 int
-aldap_parse_url(char *url, struct aldap_url *lu)
+aldap_parse_url(const char *url, struct aldap_url *lu)
 {
 	char		*p, *forward, *forward2;
 	const char	*errstr = NULL;
@@ -715,10 +709,20 @@ aldap_parse_url(char *url, struct aldap_url *lu)
 		return (-1);
 
 	/* protocol */
-	if (strncasecmp(LDAP_URL, p, strlen(LDAP_URL)) != 0)
-		goto fail;
-	lu->protocol = LDAP;
-	p += strlen(LDAP_URL);
+	if (strncasecmp(LDAP_URL, p, strlen(LDAP_URL)) == 0) {
+		lu->protocol = LDAP;
+		p += strlen(LDAP_URL);
+	} else if (strncasecmp(LDAPS_URL, p, strlen(LDAPS_URL)) == 0) {
+		lu->protocol = LDAPS;
+		p += strlen(LDAPS_URL);
+	} else if (strncasecmp(LDAPTLS_URL, p, strlen(LDAPTLS_URL)) == 0) {
+		lu->protocol = LDAPTLS;
+		p += strlen(LDAPTLS_URL);
+	} else if (strncasecmp(LDAPI_URL, p, strlen(LDAPI_URL)) == 0) {
+		lu->protocol = LDAPI;
+		p += strlen(LDAPI_URL);
+	} else
+		lu->protocol = -1;
 
 	/* host and optional port */
 	if ((forward = strchr(p, '/')) != NULL)
@@ -798,7 +802,6 @@ aldap_parse_url(char *url, struct aldap_url *lu)
 	if (p)
 		lu->filter = p;
 done:
-	free(url);
 	return (1);
 fail:
 	free(lu->buffer);
@@ -808,7 +811,7 @@ fail:
 
 int
 aldap_search_url(struct aldap *ldap, char *url, int typesonly, int sizelimit,
-    int timelimit)
+    int timelimit, struct aldap_page_control *page)
 {
 	struct aldap_url *lu;
 
@@ -819,7 +822,7 @@ aldap_search_url(struct aldap *ldap, char *url, int typesonly, int sizelimit,
 		goto fail;
 
 	if (aldap_search(ldap, lu->dn, lu->scope, lu->filter, lu->attributes,
-	    typesonly, sizelimit, timelimit) == -1)
+	    typesonly, sizelimit, timelimit, page) == -1)
 		goto fail;
 
 	aldap_free_url(lu);
@@ -828,7 +831,6 @@ fail:
 	aldap_free_url(lu);
 	return (-1);
 }
-#endif /* 0 */
 
 /*
  * internal functions
@@ -1215,7 +1217,7 @@ ldap_debug_elements(struct ber_element *root)
 		break;
 	case BER_CLASS_PRIVATE:
 		fprintf(stderr, "class: private(%u) type: ", root->be_class);
-		fprintf(stderr, "encoding (%lu) type: ", root->be_encoding);
+		fprintf(stderr, "encoding (%u) type: ", root->be_encoding);
 		break;
 	case BER_CLASS_CONTEXT:
 		/* XXX: this is not correct */
@@ -1230,7 +1232,7 @@ ldap_debug_elements(struct ber_element *root)
 		fprintf(stderr, "class: <INVALID>(%u) type: ", root->be_class);
 		break;
 	}
-	fprintf(stderr, "(%lu) encoding %lu ",
+	fprintf(stderr, "(%u) encoding %u ",
 	    root->be_type, root->be_encoding);
 
 	if (constructed)
@@ -1280,7 +1282,7 @@ ldap_debug_elements(struct ber_element *root)
 			fprintf(stderr, "<INVALID>\n");
 			break;
 		}
-		fprintf(stderr, "string \"%.*s\"\n",  len, buf);
+		fprintf(stderr, "string \"%.*s\"\n",  (int)len, buf);
 		break;
 	case BER_TYPE_NULL:	/* no payload */
 	case BER_TYPE_EOC:

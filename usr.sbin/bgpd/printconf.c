@@ -1,4 +1,4 @@
-/*	$OpenBSD: printconf.c,v 1.106 2017/08/12 16:47:50 phessler Exp $	*/
+/*	$OpenBSD: printconf.c,v 1.109 2018/07/11 14:08:46 benno Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -40,6 +40,7 @@ void		 print_rdomain_targets(struct filter_set_head *, const char *);
 void		 print_rdomain(struct rdomain *);
 const char	*print_af(u_int8_t);
 void		 print_network(struct network_config *, const char *);
+void		 print_prefixsets(struct prefixset_head *);
 void		 print_peer(struct peer_config *, struct bgpd_config *,
 		    const char *);
 const char	*print_auth_alg(u_int8_t);
@@ -409,6 +410,10 @@ print_network(struct network_config *n, const char *c)
 		printf("%snetwork %s rtlabel \"%s\"", c,
 		    print_af(n->prefix.aid), rtlabel_id2name(n->rtlabel));
 		break;
+	case NETWORK_PRIORITY:
+		printf("%snetwork %s priority %d", c,
+		    print_af(n->prefix.aid), n->priority);
+		break;
 	default:
 		printf("%snetwork %s/%u", c, log_addr(&n->prefix),
 		    n->prefixlen);
@@ -418,6 +423,35 @@ print_network(struct network_config *n, const char *c)
 		printf(" ");
 	print_set(&n->attrset);
 	printf("\n");
+}
+
+void
+print_prefixsets(struct prefixset_head *psh)
+{
+	struct prefixset	*ps;
+	struct prefixset_item	*psi;
+
+	SIMPLEQ_FOREACH(ps, psh, entry) {
+		printf("prefix-set \"%s\" { ", ps->name);
+		SIMPLEQ_FOREACH(psi, &ps->psitems, entry) {
+			if (psi->p.addr.aid)
+				printf("%s/%u ", log_addr(&psi->p.addr),
+				    psi->p.len);
+			if (psi->p.op) {
+				if (psi->p.op == OP_RANGE ||
+				    psi->p.op == OP_XRANGE) {
+					printf("prefixlen %u ", psi->p.len_min);
+					print_op(psi->p.op);
+					printf(" %u ", psi->p.len_max);
+				} else {
+					printf("prefixlen ");
+					print_op(psi->p.op);
+					printf(" %u ", psi->p.len_min);
+				}
+			}
+		}
+		printf(" }\n");
+	}
 }
 
 void
@@ -470,16 +504,10 @@ print_peer(struct peer_config *p, struct bgpd_config *conf, const char *c)
 		printf("%s\tannounce restart no\n", c);
 	if (p->capabilities.as4byte == 0)
 		printf("%s\tannounce as4byte no\n", c);
-	if (p->announce_type == ANNOUNCE_SELF)
-		printf("%s\tannounce self\n", c);
-	else if (p->announce_type == ANNOUNCE_NONE)
-		printf("%s\tannounce none\n", c);
-	else if (p->announce_type == ANNOUNCE_ALL)
-		printf("%s\tannounce all\n", c);
-	else if (p->announce_type == ANNOUNCE_DEFAULT_ROUTE)
-		printf("%s\tannounce default-route\n", c);
-	else
-		printf("%s\tannounce ???\n", c);
+	if (p->export_type == EXPORT_NONE)
+		printf("%s\texport none\n", c);
+	else if (p->export_type == EXPORT_DEFAULT_ROUTE)
+		printf("%s\texport default-route\n", c);
 	if (p->enforce_as == ENFORCE_AS_ON)
 		printf("%s\tenforce neighbor-as yes\n", c);
 	else
@@ -665,6 +693,9 @@ print_rule(struct peer *peer_l, struct filter_rule *r)
 		}
 	}
 
+	if (r->match.prefixset.flags & PREFIXSET_FLAG_FILTER)
+		printf("prefix-set \"%s\" ", r->match.prefixset.name);
+
 	if (r->match.nexthop.flags) {
 		if (r->match.nexthop.flags == FILTER_NEXTHOP_NEIGHBOR)
 			printf("nexthop neighbor ");
@@ -847,6 +878,8 @@ print_config(struct bgpd_config *conf, struct rib_names *rib_l,
 			    rr->rtableid, rr->flags & F_RIB_NOFIBSYNC ?
 			    "no" : "yes");
 	}
+	printf("\n");
+	print_prefixsets(conf->prefixsets);
 	printf("\n");
 	print_mrt(conf, 0, 0, "", "");
 	printf("\n");

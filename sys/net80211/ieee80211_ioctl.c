@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_ioctl.c,v 1.58 2017/11/27 20:54:38 stsp Exp $	*/
+/*	$OpenBSD: ieee80211_ioctl.c,v 1.63 2018/08/06 11:42:18 benno Exp $	*/
 /*	$NetBSD: ieee80211_ioctl.c,v 1.15 2004/05/06 02:58:16 dyoung Exp $	*/
 
 /*-
@@ -391,7 +391,11 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	struct ieee80211com *ic = (void *)ifp;
 	struct ifreq *ifr = (struct ifreq *)data;
 	int i, error = 0;
+	size_t len;
 	struct ieee80211_nwid nwid;
+	struct ieee80211_join join;
+	struct ieee80211_joinreq_all *ja;
+	struct ieee80211_ess *ess;
 	struct ieee80211_wpapsk *psk;
 	struct ieee80211_keyavail *ka;
 	struct ieee80211_keyrun *kr;
@@ -414,7 +418,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		error = ifmedia_ioctl(ifp, ifr, &ic->ic_media, cmd);
 		break;
 	case SIOCS80211NWID:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		if ((error = copyin(ifr->ifr_data, &nwid, sizeof(nwid))) != 0)
 			break;
@@ -445,24 +449,88 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		}
 		error = copyout(&nwid, ifr->ifr_data, sizeof(nwid));
 		break;
+	case SIOCS80211JOIN:
+		if ((error = suser(curproc)) != 0)
+			break;
+		if ((error = copyin(ifr->ifr_data, &join, sizeof(join))) != 0)
+			break;
+		if (join.i_len > IEEE80211_NWID_LEN) {
+			error = EINVAL;
+			break;
+		}
+		if (join.i_flags & IEEE80211_JOIN_DEL)
+			ieee80211_del_ess(ic, join.i_nwid, join.i_len ? 0 : 1);
+		memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
+		ic->ic_des_esslen = join.i_len;
+		memcpy(ic->ic_des_essid, join.i_nwid, join.i_len);
+		/* disable WPA/WEP */
+		ieee80211_disable_rsn(ic);
+		ieee80211_disable_wep(ic);
+		/* save nwid for auto-join */
+		if (!(join.i_flags & IEEE80211_JOIN_DEL))
+			ieee80211_add_ess(ic, 0, 0);
+		ieee80211_set_ess(ic, ic->ic_des_essid);
+		error = ENETRESET;
+		break;
+	case SIOCG80211JOIN:
+		memset(&join, 0, sizeof(join));
+		error = ENOENT;
+		if (ic->ic_bss == NULL)
+			break;
+		TAILQ_FOREACH(ess, &ic->ic_ess, ess_next) {
+			if (memcmp(ess->essid, ic->ic_bss->ni_essid,
+			    IEEE80211_NWID_LEN) == 0) {
+				join.i_len = ic->ic_bss->ni_esslen;
+				memcpy(join.i_nwid, ic->ic_bss->ni_essid,
+				    join.i_len);
+				join.i_flags = IEEE80211_JOIN_FOUND;
+				error = copyout(&join, ifr->ifr_data,
+				    sizeof(join));
+				break;
+			}
+		}
+		break;
+	case SIOCG80211JOINALL:
+		ja = (struct ieee80211_joinreq_all *)data;
+		ja->ja_nodes = len = 0;
+		TAILQ_FOREACH(ess, &ic->ic_ess, ess_next) {
+			if (len + sizeof(ja->ja_node[0]) >= ja->ja_size) {
+				error = E2BIG;
+				break;
+			}
+			memset(&join, 0, sizeof(join));
+			join.i_len = ess->esslen;
+			memcpy(&join.i_nwid, ess->essid, join.i_len);
+			error = copyout(&join, &ja->ja_node[ja->ja_nodes],
+			    sizeof(ja->ja_node[0]));
+			if (error)
+				break;
+			len += sizeof(join);
+			ja->ja_nodes++;
+		}
+		break;
 	case SIOCS80211NWKEY:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		error = ieee80211_ioctl_setnwkeys(ic, (void *)data);
+		if (error == ENETRESET)
+			ieee80211_add_ess(ic, 0, 1);
 		break;
 	case SIOCG80211NWKEY:
 		error = ieee80211_ioctl_getnwkeys(ic, (void *)data);
 		break;
 	case SIOCS80211WPAPARMS:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		error = ieee80211_ioctl_setwpaparms(ic, (void *)data);
+		if (error == ENETRESET)
+			ieee80211_add_ess(ic, 1, 0);
 		break;
 	case SIOCG80211WPAPARMS:
 		error = ieee80211_ioctl_getwpaparms(ic, (void *)data);
 		break;
 	case SIOCS80211WPAPSK:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		psk = (struct ieee80211_wpapsk *)data;
 		if (psk->i_enabled) {
@@ -474,6 +542,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			ic->ic_flags &= ~IEEE80211_F_PSK;
 			memset(ic->ic_psk, 0, sizeof(ic->ic_psk));
 		}
+		ieee80211_add_ess(ic, 1, 0);
 		error = ENETRESET;
 		break;
 	case SIOCG80211WPAPSK:
@@ -487,14 +556,14 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			psk->i_enabled = 0;
 		break;
 	case SIOCS80211KEYAVAIL:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		ka = (struct ieee80211_keyavail *)data;
 		(void)ieee80211_pmksa_add(ic, IEEE80211_AKM_8021X,
 		    ka->i_macaddr, ka->i_key, ka->i_lifetime);
 		break;
 	case SIOCS80211KEYRUN:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		kr = (struct ieee80211_keyrun *)data;
 		error = ieee80211_keyrun(ic, kr->i_macaddr);
@@ -502,7 +571,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			ieee80211_disable_wep(ic);
 		break;
 	case SIOCS80211POWER:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		power = (struct ieee80211_power *)data;
 		ic->ic_lintval = power->i_maxsleep;
@@ -526,7 +595,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		power->i_maxsleep = ic->ic_lintval;
 		break;
 	case SIOCS80211BSSID:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		bssid = (struct ieee80211_bssid *)data;
 		if (IEEE80211_ADDR_EQ(bssid->i_bssid, empty_macaddr))
@@ -576,7 +645,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		}
 		break;
 	case SIOCS80211CHANNEL:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		chanreq = (struct ieee80211chanreq *)data;
 		if (chanreq->i_channel == IEEE80211_CHAN_ANY)
@@ -639,7 +708,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 #endif
 		break;
 	case SIOCS80211TXPOWER:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		txpower = (struct ieee80211_txpower *)data;
 		if ((ic->ic_caps & IEEE80211_C_TXPMGT) == 0) {
@@ -670,42 +739,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			ifp->if_mtu = ifr->ifr_mtu;
 		break;
 	case SIOCS80211SCAN:
-		if ((error = suser(curproc, 0)) != 0)
-			break;
-#ifndef IEEE80211_STA_ONLY
-		if (ic->ic_opmode == IEEE80211_M_HOSTAP)
-			break;
-#endif
-		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) !=
-		    (IFF_UP | IFF_RUNNING)) {
-			error = ENETDOWN;
-			break;
-		}
-		if ((ic->ic_scan_lock & IEEE80211_SCAN_REQUEST) == 0) {
-			if (ic->ic_scan_lock & IEEE80211_SCAN_LOCKED)
-				ic->ic_scan_lock |= IEEE80211_SCAN_RESUME;
-			ic->ic_scan_lock |= IEEE80211_SCAN_REQUEST;
-			if (ic->ic_state != IEEE80211_S_SCAN) {
-				ieee80211_clean_cached(ic);
-				if (ic->ic_opmode == IEEE80211_M_STA &&
-				    ic->ic_state == IEEE80211_S_RUN &&
-				    IFM_MODE(ic->ic_media.ifm_cur->ifm_media)
-				    == IFM_AUTO) {
-					/* 
-					 * We're already associated to an AP.
-					 * Make the scanning loop start off in
-					 * auto mode so all supported bands
-					 * get scanned.
-					 */
-					ieee80211_setmode(ic,
-					    IEEE80211_MODE_AUTO);
-				}
-				ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
-			}
-		}
-		/* Let the userspace process wait for completion */
-		error = tsleep(&ic->ic_scan_lock, PCATCH, "80211scan",
-		    hz * IEEE80211_SCAN_TIMEOUT);
+		/* Disabled. SIOCG80211ALLNODES is enough. */
 		break;
 	case SIOCG80211NODE:
 		nr = (struct ieee80211_nodereq *)data;
@@ -717,7 +751,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		ieee80211_node2req(ic, ni, nr);
 		break;
 	case SIOCS80211NODE:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 #ifndef IEEE80211_STA_ONLY
 		if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
@@ -740,7 +774,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 #ifndef IEEE80211_STA_ONLY
 	case SIOCS80211DELNODE:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		nr = (struct ieee80211_nodereq *)data;
 		ni = ieee80211_find_node(ic, nr->nr_macaddr);
@@ -769,6 +803,12 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 #endif
 	case SIOCG80211ALLNODES:
+		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) !=
+		    (IFF_UP | IFF_RUNNING)) {
+			error = ENETDOWN;
+			break;
+		}
+
 		na = (struct ieee80211_nodereq_all *)data;
 		na->na_nodes = i = 0;
 		ni = RBT_MIN(ieee80211_tree, &ic->ic_tree);
@@ -793,7 +833,7 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		ifr->ifr_flags = flags >> IEEE80211_F_USERSHIFT;
 		break;
 	case SIOCS80211FLAGS:
-		if ((error = suser(curproc, 0)) != 0)
+		if ((error = suser(curproc)) != 0)
 			break;
 		flags = (u_int32_t)ifr->ifr_flags << IEEE80211_F_USERSHIFT;
 		if (

@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysctl.c,v 1.228 2017/07/19 06:30:54 florian Exp $	*/
+/*	$OpenBSD: sysctl.c,v 1.233 2018/07/16 17:05:15 jasper Exp $	*/
 /*	$NetBSD: sysctl.c,v 1.9 1995/09/30 07:12:50 thorpej Exp $	*/
 
 /*
@@ -129,6 +129,7 @@ struct ctlname *vfsname;
 struct ctlname machdepname[] = CTL_MACHDEP_NAMES;
 #endif
 struct ctlname ddbname[] = CTL_DDB_NAMES;
+struct ctlname audioname[] = CTL_KERN_AUDIO_NAMES;
 char names[BUFSIZ];
 int lastused;
 
@@ -182,6 +183,8 @@ int	Aflag, aflag, nflag, qflag;
 /* prototypes */
 void debuginit(void);
 void listall(char *, struct list *);
+int parse_hex_char(char);
+ssize_t parse_hex_string(unsigned char *, size_t, const char *);
 void parse(char *, int);
 void parse_baddynamic(int *, size_t, char *, void **, size_t *, int, int);
 void usage(void);
@@ -210,6 +213,7 @@ void print_sensor(struct sensor *);
 #ifdef CPU_CHIPSET
 int sysctl_chipset(char *, char **, int *, int, int *);
 #endif
+int sysctl_audio(char *, char **, int *, int, int *);
 void vfsinit(void);
 
 char *equ = "=";
@@ -286,6 +290,53 @@ listall(char *prefix, struct list *lp)
 	}
 }
 
+int
+parse_hex_char(char ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return (ch - '0');
+
+	ch = tolower((unsigned char)ch);
+	if (ch >= 'a' && ch <= 'f')
+		return (ch - 'a' + 10);
+
+	return (-1);
+}
+
+ssize_t
+parse_hex_string(unsigned char *dst, size_t dstlen, const char *src)
+{
+	ssize_t len = 0;
+	int digit;
+
+	while (len < dstlen) {
+		if (*src == '\0')
+			return (len);
+
+		digit = parse_hex_char(*src++);
+		if (digit == -1)
+			return (-1);
+		dst[len] = digit << 4;
+
+		digit = parse_hex_char(*src++);
+		if (digit == -1)
+			return (-1);
+		
+		dst[len] |= digit;
+		len++;
+	}
+
+	while (*src != '\0') {
+		if (parse_hex_char(*src++) == -1 ||
+		    parse_hex_char(*src++) == -1)
+			return (-1);
+
+		len++;
+	}
+
+	return (len);
+}
+
 /*
  * Parse a name into a MIB entry.
  * Lookup and print out the MIB entry if it exists.
@@ -302,6 +353,7 @@ parse(char *string, int flags)
 	struct list *lp;
 	int mib[CTL_MAXNAME];
 	char *cp, *bufp, buf[SYSCTL_BUFSIZ];
+	unsigned char hex[SYSCTL_BUFSIZ];
 
 	(void)strlcpy(buf, string, sizeof(buf));
 	bufp = buf;
@@ -445,6 +497,11 @@ parse(char *string, int flags)
 		case KERN_SOMINCONN:
 			special |= UNSIGNED;
 			break;
+		case KERN_AUDIO:
+			len = sysctl_audio(string, &bufp, mib, flags, &type);
+			if (len < 0)
+				return;
+			break;
 		}
 		break;
 
@@ -566,6 +623,10 @@ parse(char *string, int flags)
 			len = sysctl_inet6(string, &bufp, mib, flags, &type);
 			if (len < 0)
 				return;
+
+			if (mib[2] == IPPROTO_IPV6 &&
+			    mib[3] == IPV6CTL_SOIIKEY)
+				special |= HEX;
 
 			if ((mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_MRTMFC) ||
 			    (mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_MRTMIF) ||
@@ -716,6 +777,27 @@ parse(char *string, int flags)
 			(void)sscanf(newval, "%lld", &quadval);
 			newval = &quadval;
 			newsize = sizeof(quadval);
+			break;
+		case CTLTYPE_STRING:
+			if (special & HEX) {
+				ssize_t len;
+
+				len = parse_hex_string(hex, sizeof(hex),
+				    newval);
+				if (len == -1) {
+					warnx("%s: hex string %s: invalid",
+					    string, newval);
+					return;
+				}
+				if (len > sizeof(hex)) {
+					warnx("%s: hex string %s: too long",
+					    string, newval);
+					return;
+				}
+
+				newval = hex;
+				newsize = len;
+			}
 			break;
 		}
 	}
@@ -936,13 +1018,30 @@ parse(char *string, int flags)
 		if (newval == NULL) {
 			if (!nflag)
 				(void)printf("%s%s", string, equ);
-			(void)puts(buf);
-		} else {
-			if (!qflag) {
-				if (!nflag)
-					(void)printf("%s: %s -> ", string, buf);
-				(void)puts((char *)newval);
+			if (special & HEX) {
+				size_t i;
+				for (i = 0; i < size; i++) {
+					(void)printf("%02x",
+					    (unsigned char)buf[i]);
+				}
+				(void)printf("\n");
+			} else
+				(void)puts(buf);
+		} else if (!qflag) {
+			if (!nflag) {
+				(void)printf("%s: ", string);
+				if (special & HEX) {
+					size_t i;
+					for (i = 0; i < size; i++) {
+						(void)printf("%02x",
+						    (unsigned char)buf[i]);
+					}
+				} else
+					(void)printf("%s", buf);
+
+				(void)printf(" -> ");
 			}
+			(void)puts(cp);
 		}
 		return;
 
@@ -1612,6 +1711,7 @@ struct list semlist = { semname, KERN_SEMINFO_MAXID };
 struct list shmlist = { shmname, KERN_SHMINFO_MAXID };
 struct list watchdoglist = { watchdogname, KERN_WATCHDOG_MAXID };
 struct list tclist = { tcname, KERN_TIMECOUNTER_MAXID };
+struct list audiolist = { audioname, KERN_AUDIO_MAXID };
 
 /*
  * handle vfs namei cache statistics
@@ -2208,12 +2308,7 @@ sysctl_pipex(char *string, char **bufpp, int mib[], int flags, int *typep)
  * Handle SysV semaphore info requests
  */
 int
-sysctl_seminfo(string, bufpp, mib, flags, typep)
-	char *string;
-	char **bufpp;
-	int mib[];
-	int flags;
-	int *typep;
+sysctl_seminfo(char *string, char **bufpp, int mib[], int flags, int *typep)
 {
 	int indx;
 
@@ -2232,12 +2327,7 @@ sysctl_seminfo(string, bufpp, mib, flags, typep)
  * Handle SysV shared memory info requests
  */
 int
-sysctl_shminfo(string, bufpp, mib, flags, typep)
-	char *string;
-	char **bufpp;
-	int mib[];
-	int flags;
-	int *typep;
+sysctl_shminfo(char *string, char **bufpp, int mib[], int flags, int *typep)
 {
 	int indx;
 
@@ -2603,6 +2693,25 @@ print_sensor(struct sensor *s)
 }
 
 /*
+ * Handle audio support
+ */
+int
+sysctl_audio(char *string, char **bufpp, int mib[], int flags, int *typep)
+{
+	int indx;
+
+	if (*bufpp == NULL) {
+		listall(string, &audiolist);
+		return (-1);
+	}
+	if ((indx = findname(string, "third", bufpp, &audiolist)) == -1)
+		return (-1);
+	mib[2] = indx;
+	*typep = audiolist.list[indx].ctl_type;
+	return (3);
+}
+
+/*
  * Scan a list of names searching for a particular name.
  */
 int
@@ -2631,8 +2740,6 @@ usage(void)
 {
 
 	(void)fprintf(stderr,
-	    "usage: sysctl [-Aan]\n"
-	    "       sysctl [-n] name ...\n"
-	    "       sysctl [-nq] name=value ...\n");
+	    "usage: sysctl [-Aanq] [name[=value]]\n");
 	exit(1);
 }

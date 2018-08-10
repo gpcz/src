@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_fork.c,v 1.202 2017/12/30 20:47:00 guenther Exp $	*/
+/*	$OpenBSD: kern_fork.c,v 1.205 2018/07/20 07:28:36 beck Exp $	*/
 /*	$NetBSD: kern_fork.c,v 1.29 1996/02/09 18:59:34 christos Exp $	*/
 
 /*
@@ -74,6 +74,8 @@ void fork_return(void *);
 pid_t alloctid(void);
 pid_t allocpid(void);
 int ispidtaken(pid_t);
+
+void unveil_copy(struct process *parent, struct process *child);
 
 struct proc *thread_new(struct proc *_parent, vaddr_t _uaddr);
 struct process *process_new(struct proc *, struct process *, int);
@@ -198,6 +200,7 @@ process_initialize(struct process *pr, struct proc *p)
 	KASSERT(p->p_ucred->cr_ref >= 2);	/* new thread and new process */
 
 	LIST_INIT(&pr->ps_children);
+	LIST_INIT(&pr->ps_kqlist);
 
 	timeout_set(&pr->ps_realit_to, realitexpire, pr);
 }
@@ -234,6 +237,9 @@ process_new(struct proc *p, struct process *parent, int flags)
 	pr->ps_textvp = parent->ps_textvp;
 	if (pr->ps_textvp)
 		vref(pr->ps_textvp);
+
+	/* copy unveil if unveil is active */
+	unveil_copy(parent, pr);
 
 	pr->ps_flags = parent->ps_flags &
 	    (PS_SUGID | PS_SUGIDEXEC | PS_PLEDGE | PS_EXECPLEDGE | PS_WXNEEDED);

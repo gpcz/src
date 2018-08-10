@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_sysctl.c,v 1.331 2018/01/02 06:38:45 guenther Exp $	*/
+/*	$OpenBSD: kern_sysctl.c,v 1.346 2018/07/12 01:23:38 cheloha Exp $	*/
 /*	$NetBSD: kern_sysctl.c,v 1.17 1996/05/20 17:49:05 mrg Exp $	*/
 
 /*-
@@ -79,6 +79,7 @@
 #include <sys/sched.h>
 #include <sys/mount.h>
 #include <sys/syscallargs.h>
+#include <sys/witness.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -112,6 +113,8 @@
 #include <sys/shm.h>
 #endif
 
+#include "audio.h"
+
 extern struct forkstat forkstat;
 extern struct nchstats nchstats;
 extern int nselcoll, fscale;
@@ -119,6 +122,9 @@ extern struct disklist_head disklist;
 extern fixpt_t ccpu;
 extern  long numvnodes;
 extern u_int net_livelocks;
+#if NAUDIO > 0
+extern int audio_record_enable;
+#endif
 
 int allowkmem;
 
@@ -133,6 +139,9 @@ int sysctl_proc_vmmap(int *, u_int, void *, size_t *, struct proc *);
 int sysctl_intrcnt(int *, u_int, void *, size_t *);
 int sysctl_sensors(int *, u_int, void *, size_t *, void *, size_t);
 int sysctl_cptime2(int *, u_int, void *, size_t *, void *, size_t);
+#if NAUDIO > 0
+int sysctl_audio(int *, u_int, void *, size_t *, void *, size_t);
+#endif
 
 void fill_file(struct kinfo_file *, struct file *, struct filedesc *, int,
     struct vnode *, struct process *, struct proc *, struct socket *, int);
@@ -164,7 +173,7 @@ sys_sysctl(struct proc *p, void *v, register_t *retval)
 	int name[CTL_MAXNAME];
 
 	if (SCARG(uap, new) != NULL &&
-	    (error = suser(p, 0)))
+	    (error = suser(p)))
 		return (error);
 	/*
 	 * all top-level sysctl names are non-terminal
@@ -301,6 +310,7 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		case KERN_TIMECOUNTER:
 		case KERN_CPTIME2:
 		case KERN_FILE:
+		case KERN_AUDIO:
 			break;
 		default:
 			return (ENOTDIR);	/* overloaded */
@@ -487,7 +497,7 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdint(oldp, oldlenp, newp, mp->msg_bufs));
 	}
 	case KERN_CONSBUF:
-		if ((error = suser(p, 0)))
+		if ((error = suser(p)))
 			return (error);
 		/* FALLTHROUGH */
 	case KERN_MSGBUF: {
@@ -650,6 +660,15 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		dnsjackport = port;
 		return 0;
 	}
+#ifdef WITNESS
+	case KERN_WITNESSWATCH:
+		return witness_sysctl_watch(oldp, oldlenp, newp, newlen);
+#endif
+#if NAUDIO > 0
+	case KERN_AUDIO:
+		return (sysctl_audio(name + 1, namelen - 1, oldp, oldlenp,
+		    newp, newlen));
+#endif
 	default:
 		return (EOPNOTSUPP);
 	}
@@ -682,6 +701,9 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdint(oldp, oldlenp, newp, ncpus));
 	case HW_NCPUFOUND:
 		return (sysctl_rdint(oldp, oldlenp, newp, ncpusfound));
+	case HW_NCPUONLINE:
+		return (sysctl_rdint(oldp, oldlenp, newp,
+		    sysctl_hwncpuonline()));
 	case HW_BYTEORDER:
 		return (sysctl_rdint(oldp, oldlenp, newp, BYTE_ORDER));
 	case HW_PHYSMEM:
@@ -763,6 +785,10 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 			    allowpowerdown));
 		return (sysctl_int(oldp, oldlenp, newp, newlen,
 		    &allowpowerdown));
+#ifdef __HAVE_CPU_TOPOLOGY
+	case HW_SMT:
+		return (sysctl_hwsmt(oldp, oldlenp, newp, newlen));
+#endif
 	default:
 		return (EOPNOTSUPP);
 	}
@@ -1065,13 +1091,15 @@ fill_file(struct kinfo_file *kf, struct file *fp, struct filedesc *fdp,
 			kf->f_data = PTRTOINT64(fp->f_data);
 		kf->f_usecount = 0;
 
-		if (suser(p, 0) == 0 || p->p_ucred->cr_uid == fp->f_cred->cr_uid) {
+		if (suser(p) == 0 || p->p_ucred->cr_uid == fp->f_cred->cr_uid) {
 			kf->f_offset = fp->f_offset;
+			mtx_enter(&fp->f_mtx);
 			kf->f_rxfer = fp->f_rxfer;
 			kf->f_rwfer = fp->f_wxfer;
 			kf->f_seek = fp->f_seek;
 			kf->f_rbytes = fp->f_rbytes;
 			kf->f_wbytes = fp->f_wbytes;
+			mtx_leave(&fp->f_mtx);
 		} else
 			kf->f_offset = -1;
 	} else if (vp != NULL) {
@@ -1237,8 +1265,11 @@ fill_file(struct kinfo_file *kf, struct file *fp, struct filedesc *fdp,
 		kf->p_tid = -1;
 		strlcpy(kf->p_comm, pr->ps_comm, sizeof(kf->p_comm));
 	}
-	if (fdp != NULL)
+	if (fdp != NULL) {
+		fdplock(fdp);
 		kf->fd_ofileflags = fdp->fd_ofileflags[fd];
+		fdpunlock(fdp);
+	}
 }
 
 /*
@@ -1250,7 +1281,7 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 {
 	struct kinfo_file *kf;
 	struct filedesc *fdp;
-	struct file *fp, *nfp;
+	struct file *fp;
 	struct process *pr;
 	size_t buflen, elem_size, elem_count, outsize;
 	char *dp = where;
@@ -1273,7 +1304,7 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 	if (elem_size < 1)
 		return (EINVAL);
 
-	show_pointers = suser(curproc, 0) == 0;
+	show_pointers = suser(curproc) == 0;
 
 	kf = malloc(sizeof(*kf), M_TEMP, M_WAITOK);
 
@@ -1298,10 +1329,6 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 	case KERN_FILE_BYFILE:
 		/* use the inp-tables to pick up closed connections, too */
 		if (arg == DTYPE_SOCKET) {
-			extern struct inpcbtable rawcbtable;
-#ifdef INET6
-			extern struct inpcbtable rawin6pcbtable;
-#endif
 			struct inpcb *inp;
 
 			NET_LOCK();
@@ -1318,17 +1345,9 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 #endif
 			NET_UNLOCK();
 		}
-		fp = LIST_FIRST(&filehead);
-		/* don't FREF when f_count == 0 to avoid race in fdrop() */
-		while (fp != NULL && fp->f_count == 0)
-			fp = LIST_NEXT(fp, f_list);
-		if (fp == NULL)
-			break;
-		FREF(fp);
-		do {
-			if (fp->f_count > 1 && /* 0, +1 for our FREF() */
-			    FILE_IS_USABLE(fp) &&
-			    (arg == 0 || fp->f_type == arg)) {
+		fp = NULL;
+		while ((fp = fd_iterfile(fp, p)) != NULL) {
+			if ((arg == 0 || fp->f_type == arg)) {
 				int af, skip = 0;
 				if (arg == DTYPE_SOCKET && fp->f_type == arg) {
 					af = ((struct socket *)fp->f_data)->
@@ -1339,14 +1358,7 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 				if (!skip)
 					FILLIT(fp, NULL, 0, NULL, NULL);
 			}
-			nfp = LIST_NEXT(fp, f_list);
-			while (nfp != NULL && nfp->f_count == 0)
-				nfp = LIST_NEXT(nfp, f_list);
-			if (nfp != NULL)
-				FREF(nfp);
-			FRELE(fp, p);
-			fp = nfp;
-		} while (fp != NULL);
+		}
 		break;
 	case KERN_FILE_BYPID:
 		/* A arg of -1 indicates all processes */
@@ -1377,11 +1389,10 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 			if (pr->ps_tracevp)
 				FILLIT(NULL, NULL, KERN_FILE_TRACE, pr->ps_tracevp, pr);
 			for (i = 0; i < fdp->fd_nfiles; i++) {
-				if ((fp = fdp->fd_ofiles[i]) == NULL)
-					continue;
-				if (!FILE_IS_USABLE(fp))
+				if ((fp = fd_getfile(fdp, i)) == NULL)
 					continue;
 				FILLIT(fp, fdp, i, NULL, pr);
+				FRELE(fp, p);
 			}
 		}
 		if (!matched)
@@ -1407,11 +1418,10 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 			if (pr->ps_tracevp)
 				FILLIT(NULL, NULL, KERN_FILE_TRACE, pr->ps_tracevp, pr);
 			for (i = 0; i < fdp->fd_nfiles; i++) {
-				if ((fp = fdp->fd_ofiles[i]) == NULL)
-					continue;
-				if (!FILE_IS_USABLE(fp))
+				if ((fp = fd_getfile(fdp, i)) == NULL)
 					continue;
 				FILLIT(fp, fdp, i, NULL, pr);
+				FRELE(fp, p);
 			}
 		}
 		break;
@@ -1464,7 +1474,7 @@ sysctl_doproc(int *name, u_int namelen, char *where, size_t *sizep)
 	dothreads = op & KERN_PROC_SHOW_THREADS;
 	op &= ~KERN_PROC_SHOW_THREADS;
 
-	show_pointers = suser(curproc, 0) == 0;
+	show_pointers = suser(curproc) == 0;
 
 	if (where != NULL)
 		kproc = malloc(sizeof(*kproc), M_TEMP, M_WAITOK);
@@ -1717,7 +1727,7 @@ sysctl_proc_args(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	/* Only owner or root can get env */
 	if ((op == KERN_PROC_NENV || op == KERN_PROC_ENV) &&
 	    (vpr->ps_ucred->cr_uid != cp->p_ucred->cr_uid &&
-	    (error = suser(cp, 0)) != 0))
+	    (error = suser(cp)) != 0))
 		return (error);
 
 	ps_strings = vpr->ps_strings;
@@ -1900,7 +1910,7 @@ sysctl_proc_cwd(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 
 	/* Only owner or root can get cwd */
 	if (findpr->ps_ucred->cr_uid != cp->p_ucred->cr_uid &&
-	    (error = suser(cp, 0)) != 0)
+	    (error = suser(cp)) != 0)
 		return (error);
 
 	len = *oldlenp;
@@ -1956,7 +1966,7 @@ sysctl_proc_nobroadcastkill(int *name, u_int namelen, void *newp, size_t newlen,
 		return (EINVAL);
 
 	/* Only root can change PS_NOBROADCASTKILL */
-	if (newp != 0 && (error = suser(cp, 0)) != 0)
+	if (newp != 0 && (error = suser(cp)) != 0)
 		return (error);
 
 	/* get the PS_NOBROADCASTKILL flag */
@@ -2018,17 +2028,17 @@ sysctl_proc_vmmap(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 
 #if 1
 		/* XXX Allow only root for now */
-		if ((error = suser(cp, 0)) != 0)
+		if ((error = suser(cp)) != 0)
 			return (error);
 #else
 		/* Only owner or root can get vmmap */
 		if (findpr->ps_ucred->cr_uid != cp->p_ucred->cr_uid &&
-		    (error = suser(cp, 0)) != 0)
+		    (error = suser(cp)) != 0)
 			return (error);
 #endif
 	} else {
 		/* Only root can get kernel_map */
-		if ((error = suser(cp, 0)) != 0)
+		if ((error = suser(cp)) != 0)
 			return (error);
 		findpr = NULL;
 	}
@@ -2351,7 +2361,6 @@ sysctl_sensors(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	free(us, M_TEMP, sizeof(*us));
 	return (ret);
 }
-
 #endif	/* SMALL_KERNEL */
 
 int
@@ -2378,3 +2387,18 @@ sysctl_cptime2(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	    &ci->ci_schedstate.spc_cp_time,
 	    sizeof(ci->ci_schedstate.spc_cp_time)));
 }
+
+#if NAUDIO > 0
+int
+sysctl_audio(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+    void *newp, size_t newlen)
+{
+	if (namelen != 1)
+		return (ENOTDIR);
+
+	if (name[0] != KERN_AUDIO_RECORD)
+		return (ENOENT);
+
+	return (sysctl_int(oldp, oldlenp, newp, newlen, &audio_record_enable));
+}
+#endif

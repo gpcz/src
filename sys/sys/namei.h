@@ -1,4 +1,4 @@
-/*	$OpenBSD: namei.h,v 1.34 2017/08/29 02:51:27 deraadt Exp $	*/
+/*	$OpenBSD: namei.h,v 1.36 2018/08/05 14:23:57 beck Exp $	*/
 /*	$NetBSD: namei.h,v 1.11 1996/02/09 18:25:20 christos Exp $	*/
 
 /*
@@ -59,17 +59,24 @@ struct nameidata {
 	struct	vnode *ni_startdir;	/* starting directory */
 	struct	vnode *ni_rootdir;	/* logical root directory */
 	uint64_t ni_pledge;		/* expected pledge for namei */
+	u_char ni_unveil;		/* required unveil flags for namei */
 	/*
 	 * Results: returned from/manipulated by lookup
 	 */
 	struct	vnode *ni_vp;		/* vnode of result */
 	struct	vnode *ni_dvp;		/* vnode of intermediate directory */
+
 	/*
 	 * Shared between namei and lookup/commit routines.
 	 */
 	size_t	ni_pathlen;		/* remaining chars in path */
 	char	*ni_next;		/* next location in pathname */
 	u_long	ni_loopcnt;		/* count of symlinks encountered */
+	struct unveil *ni_unveil_match; /* last matching unveil component */
+	struct vnode **ni_tvp;		/* traversed vnodes */
+	size_t ni_tvpend;		/* end of traversed vnode list */
+	size_t ni_tvpsize;		/* size of traversed vnode list */
+
 	/*
 	 * Lookup parameters: this structure describes the subset of
 	 * information from the nameidata structure that is passed
@@ -138,6 +145,7 @@ struct nameidata {
 #define	REQUIREDIR	0x080000      /* must be a directory */
 #define STRIPSLASHES    0x100000      /* strip trailing slashes */
 #define PDIRUNLOCK	0x200000      /* vfs_lookup() unlocked parent dir */
+#define BYPASSUNVEIL	0x400000      /* bypass pledgepath check */
 
 /*
  * Initialization of an nameidata structure.
@@ -243,4 +251,11 @@ struct	nchstats {
 	{ "ncs_dothits", CTLTYPE_QUAD },	\
 	{ "nch_dotdothits", CTLTYPE_QUAD },	\
 }
+
+/* Unveil flags for namei */
+#define	UNVEIL_READ	0x01
+#define	UNVEIL_WRITE	0x02
+#define	UNVEIL_CREATE	0x04
+#define	UNVEIL_EXEC	0x08
+
 #endif /* !_SYS_NAMEI_H_ */

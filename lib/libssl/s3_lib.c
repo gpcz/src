@@ -1,4 +1,4 @@
-/* $OpenBSD: s3_lib.c,v 1.162 2017/10/08 16:24:02 jsing Exp $ */
+/* $OpenBSD: s3_lib.c,v 1.167 2018/06/02 16:29:01 jsing Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -237,22 +237,6 @@ SSL_CIPHER ssl3_ciphers[] = {
 		.alg_bits = 128,
 	},
 
-	/* Cipher 09 */
-	{
-		.valid = 1,
-		.name = SSL3_TXT_RSA_DES_64_CBC_SHA,
-		.id = SSL3_CK_RSA_DES_64_CBC_SHA,
-		.algorithm_mkey = SSL_kRSA,
-		.algorithm_auth = SSL_aRSA,
-		.algorithm_enc = SSL_DES,
-		.algorithm_mac = SSL_SHA1,
-		.algorithm_ssl = SSL_SSLV3,
-		.algo_strength = SSL_LOW,
-		.algorithm2 = SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
-		.strength_bits = 56,
-		.alg_bits = 56,
-	},
-
 	/* Cipher 0A */
 	{
 		.valid = 1,
@@ -272,22 +256,6 @@ SSL_CIPHER ssl3_ciphers[] = {
 	/*
 	 * Ephemeral DH (DHE) ciphers.
 	 */
-
-	/* Cipher 15 */
-	{
-		.valid = 1,
-		.name = SSL3_TXT_EDH_RSA_DES_64_CBC_SHA,
-		.id = SSL3_CK_EDH_RSA_DES_64_CBC_SHA,
-		.algorithm_mkey = SSL_kDHE,
-		.algorithm_auth = SSL_aRSA,
-		.algorithm_enc = SSL_DES,
-		.algorithm_mac = SSL_SHA1,
-		.algorithm_ssl = SSL_SSLV3,
-		.algo_strength = SSL_LOW,
-		.algorithm2 = SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
-		.strength_bits = 56,
-		.alg_bits = 56,
-	},
 
 	/* Cipher 16 */
 	{
@@ -319,22 +287,6 @@ SSL_CIPHER ssl3_ciphers[] = {
 		.algorithm2 = SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
 		.strength_bits = 128,
 		.alg_bits = 128,
-	},
-
-	/* Cipher 1A */
-	{
-		.valid = 1,
-		.name = SSL3_TXT_ADH_DES_64_CBC_SHA,
-		.id = SSL3_CK_ADH_DES_64_CBC_SHA,
-		.algorithm_mkey = SSL_kDHE,
-		.algorithm_auth = SSL_aNULL,
-		.algorithm_enc = SSL_DES,
-		.algorithm_mac = SSL_SHA1,
-		.algorithm_ssl = SSL_SSLV3,
-		.algo_strength = SSL_LOW,
-		.algorithm2 = SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
-		.strength_bits = 56,
-		.alg_bits = 56,
 	},
 
 	/* Cipher 1B */
@@ -1984,6 +1936,12 @@ ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
 	case SSL_CTRL_GET_SERVER_TMP_KEY:
 		return ssl_ctrl_get_server_tmp_key(s, parg);
 
+	case SSL_CTRL_GET_MIN_PROTO_VERSION:
+		return SSL_get_min_proto_version(s);
+
+	case SSL_CTRL_GET_MAX_PROTO_VERSION:
+		return SSL_get_max_proto_version(s);
+
 	case SSL_CTRL_SET_MIN_PROTO_VERSION:
 		if (larg < 0 || larg > UINT16_MAX)
 			return 0;
@@ -2134,6 +2092,13 @@ _SSL_CTX_set_tlsext_ticket_keys(SSL_CTX *ctx, unsigned char *keys, int keys_len)
 }
 
 static int
+_SSL_CTX_get_tlsext_status_arg(SSL_CTX *ctx, void **arg)
+{
+	*arg = ctx->internal->tlsext_status_arg;
+	return 1;
+}
+
+static int
 _SSL_CTX_set_tlsext_status_arg(SSL_CTX *ctx, void *arg)
 {
 	ctx->internal->tlsext_status_arg = arg;
@@ -2215,6 +2180,9 @@ ssl3_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
 	case SSL_CTRL_SET_TLSEXT_TICKET_KEYS:
 		return _SSL_CTX_set_tlsext_ticket_keys(ctx, parg, larg);
 
+	case SSL_CTRL_GET_TLSEXT_STATUS_REQ_CB_ARG:
+		return _SSL_CTX_get_tlsext_status_arg(ctx, parg);
+
 	case SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG:
 		return _SSL_CTX_set_tlsext_status_arg(ctx, parg);
 
@@ -2232,6 +2200,12 @@ ssl3_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
 
 	case SSL_CTRL_SET_GROUPS_LIST:
 		return SSL_CTX_set1_groups_list(ctx, parg);
+
+	case SSL_CTRL_GET_MIN_PROTO_VERSION:
+		return SSL_CTX_get_min_proto_version(ctx);
+
+	case SSL_CTRL_GET_MAX_PROTO_VERSION:
+		return SSL_CTX_get_max_proto_version(ctx);
 
 	case SSL_CTRL_SET_MIN_PROTO_VERSION:
 		if (larg < 0 || larg > UINT16_MAX)
@@ -2279,6 +2253,10 @@ ssl3_ctx_callback_ctrl(SSL_CTX *ctx, int cmd, void (*fp)(void))
 		    (int (*)(SSL *, int *, void *))fp;
 		return 1;
 
+	case SSL_CTRL_GET_TLSEXT_STATUS_REQ_CB:
+		*(int (**)(SSL *, void *))fp = ctx->internal->tlsext_status_cb;
+		return 1;
+
 	case SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB:
 		ctx->internal->tlsext_status_cb = (int (*)(SSL *, void *))fp;
 		return 1;
@@ -2298,12 +2276,12 @@ ssl3_ctx_callback_ctrl(SSL_CTX *ctx, int cmd, void (*fp)(void))
 const SSL_CIPHER *
 ssl3_get_cipher_by_char(const unsigned char *p)
 {
-	CBS cipher;
 	uint16_t cipher_value;
+	CBS cbs;
 
 	/* We have to assume it is at least 2 bytes due to existing API. */
-	CBS_init(&cipher, p, 2);
-	if (!CBS_get_u16(&cipher, &cipher_value))
+	CBS_init(&cbs, p, 2);
+	if (!CBS_get_u16(&cbs, &cipher_value))
 		return NULL;
 
 	return ssl3_get_cipher_by_value(cipher_value);
@@ -2312,12 +2290,29 @@ ssl3_get_cipher_by_char(const unsigned char *p)
 int
 ssl3_put_cipher_by_char(const SSL_CIPHER *c, unsigned char *p)
 {
-	if (p != NULL) {
-		if ((c->id & ~SSL3_CK_VALUE_MASK) != SSL3_CK_ID)
-			return (0);
-		s2n(ssl3_cipher_get_value(c), p); 
-	}
+	CBB cbb;
+
+	if (p == NULL)
+		return (2);
+
+	if ((c->id & ~SSL3_CK_VALUE_MASK) != SSL3_CK_ID)
+		return (0);
+
+	memset(&cbb, 0, sizeof(cbb));
+
+	/* We have to assume it is at least 2 bytes due to existing API. */
+	if (!CBB_init_fixed(&cbb, p, 2))
+		goto err;
+	if (!CBB_add_u16(&cbb, ssl3_cipher_get_value(c)))
+		goto err;
+	if (!CBB_finish(&cbb, NULL, NULL))
+		goto err;
+
 	return (2);
+
+ err:
+	CBB_cleanup(&cbb);
+	return (0);
 }
 
 SSL_CIPHER *
@@ -2481,56 +2476,13 @@ ssl3_shutdown(SSL *s)
 int
 ssl3_write(SSL *s, const void *buf, int len)
 {
-	int	ret, n;
-
-#if 0
-	if (s->internal->shutdown & SSL_SEND_SHUTDOWN) {
-		s->internal->rwstate = SSL_NOTHING;
-		return (0);
-	}
-#endif
 	errno = 0;
+
 	if (S3I(s)->renegotiate)
 		ssl3_renegotiate_check(s);
 
-	/*
-	 * This is an experimental flag that sends the
-	 * last handshake message in the same packet as the first
-	 * use data - used to see if it helps the TCP protocol during
-	 * session-id reuse
-	 */
-	/* The second test is because the buffer may have been removed */
-	if ((s->s3->flags & SSL3_FLAGS_POP_BUFFER) && (s->wbio == s->bbio)) {
-		/* First time through, we write into the buffer */
-		if (S3I(s)->delay_buf_pop_ret == 0) {
-			ret = ssl3_write_bytes(s, SSL3_RT_APPLICATION_DATA,
-			    buf, len);
-			if (ret <= 0)
-				return (ret);
-
-			S3I(s)->delay_buf_pop_ret = ret;
-		}
-
-		s->internal->rwstate = SSL_WRITING;
-		n = BIO_flush(s->wbio);
-		if (n <= 0)
-			return (n);
-		s->internal->rwstate = SSL_NOTHING;
-
-		/* We have flushed the buffer, so remove it */
-		ssl_free_wbio_buffer(s);
-		s->s3->flags&= ~SSL3_FLAGS_POP_BUFFER;
-
-		ret = S3I(s)->delay_buf_pop_ret;
-		S3I(s)->delay_buf_pop_ret = 0;
-	} else {
-		ret = s->method->internal->ssl_write_bytes(s,
-		    SSL3_RT_APPLICATION_DATA, buf, len);
-		if (ret <= 0)
-			return (ret);
-	}
-
-	return (ret);
+	return s->method->internal->ssl_write_bytes(s,
+	    SSL3_RT_APPLICATION_DATA, buf, len);
 }
 
 static int

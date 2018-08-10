@@ -1,4 +1,4 @@
-.\"	$OpenBSD: vmctl.8,v 1.37 2018/01/03 08:17:18 jmc Exp $
+.\"	$OpenBSD: vmctl.8,v 1.44 2018/07/29 14:11:05 anton Exp $
 .\"
 .\" Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: January 3 2018 $
+.Dd $Mdocdate: July 29 2018 $
 .Dt VMCTL 8
 .Os
 .Sh NAME
@@ -81,6 +81,10 @@ Reset and terminate all VMs.
 Send a VM with the specified
 .Ar id
 to standard output and terminate it.
+.It Cm show Op Ar id
+An alias for the
+.Cm status
+command.
 .It Xo Cm start Ar name
 .Op Fl cL
 .Op Fl b Ar path
@@ -90,10 +94,11 @@ to standard output and terminate it.
 .Op Fl n Ar switch
 .Bk -words
 .Op Fl r Ar path
+.Op Fl t Ar name
 .Ek
 .Xc
 Starts a VM defined by the specified name and parameters:
-.Bl -tag -width "-i count"
+.Bl -tag -width "-I parent"
 .It Fl b Ar path
 Boot the VM with the specified kernel or BIOS image.
 If not specified, the default is to boot using the BIOS image in
@@ -135,6 +140,13 @@ This image file will be available in the
 selected VM as a SCSI CD-ROM device attached to a virtio SCSI adapter
 (e.g.\&
 .Xr vioscsi 4 ) .
+.It Fl t Ar name
+Use an existing VM with the specified
+.Ar name
+as a template to create a new VM instance.
+The instance will inherit settings from the parent VM,
+except for exclusive options such as disk, interface lladdr, or
+interface names.
 .El
 .Pp
 Note that the VM name supplied to the 'start' command can only consist of
@@ -143,14 +155,23 @@ with '.', '-' or '_'.
 .It Cm status Op Ar id
 Lists VMs running on the host, optionally listing just the selected VM
 .Ar id .
-.It Cm stop Ar id
+.It Cm stop Ar id Op Fl fw
 Stops (terminates) a VM defined by the specified VM
 .Ar id .
-A graceful shutdown will be attempted if the VM supports the
+By default,
+a graceful shutdown will be attempted if the VM supports the
 .Xr vmmci 4
 device.
 Once stopped, if the VM was not defined in a configuration file, then it is
 removed.
+.Pp
+The following options can be specified when stopping a VM:
+.Bl -tag -width "-w"
+.It Fl f
+Forcefully stop the VM without attempting a graceful shutdown.
+.It Fl w
+Wait until the VM has been terminated.
+.El
 .It Cm unpause Ar id
 Unpause (resume from a paused state) a VM with the specified
 .Ar id .
@@ -227,14 +248,17 @@ interface as both the default route and the (sole) nameserver.
 Guest VM traffic can optionally be NATed through the host
 with an entry in the host machine's
 .Pa /etc/pf.conf
-similar to the following (if desired):
+similar to the following:
 .Bd -literal -offset indent
 pass out on $ext_if from 100.64.0.0/10 to any nat-to $ext_if
 .Ed
 .Pp
-If NATing is desired, the net.inet.ip.forwarding sysctl must also be set to 1.
+If NAT is desired, the
+.Va net.inet.ip.forwarding
+.Xr sysctl 8
+must also be set to 1.
 .Pp
-If desired, DNS queries originating from Guest VMs can be redirected to a
+If desired, DNS queries originating from guest VMs can be redirected to a
 different DNS server with an entry in the host machine's
 .Pa /etc/pf.conf
 similar to the following:
@@ -272,6 +296,12 @@ Create a new VM with 1GB memory, one network interface, one disk image
 ('disk.img') and boot from kernel '/bsd':
 .Bd -literal -offset indent
 # vmctl start "myvm" -m 1G -i 1 -b /bsd -d disk.img
+.Ed
+.Pp
+Start a new VM instance with the name 'myvm' from a pre-configured
+VM 'openbsd.4G':
+.Bd -literal -offset indent
+# vmctl start "myvm" -t "openbsd.4G" -d mydisk.img
 .Ed
 .Pp
 .Xr vmd 8

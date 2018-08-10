@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-rsa.c,v 1.64 2017/12/18 23:14:34 djm Exp $ */
+/* $OpenBSD: ssh-rsa.c,v 1.67 2018/07/03 11:39:54 djm Exp $ */
 /*
  * Copyright (c) 2000, 2003 Markus Friedl <markus@openbsd.org>
  *
@@ -46,15 +46,39 @@ rsa_hash_alg_ident(int hash_alg)
 	return NULL;
 }
 
+/*
+ * Returns the hash algorithm ID for a given algorithm identifier as used
+ * inside the signature blob,
+ */
 static int
-rsa_hash_alg_from_ident(const char *ident)
+rsa_hash_id_from_ident(const char *ident)
 {
-	if (strcmp(ident, "ssh-rsa") == 0 ||
-	    strcmp(ident, "ssh-rsa-cert-v01@openssh.com") == 0)
+	if (strcmp(ident, "ssh-rsa") == 0)
 		return SSH_DIGEST_SHA1;
 	if (strcmp(ident, "rsa-sha2-256") == 0)
 		return SSH_DIGEST_SHA256;
 	if (strcmp(ident, "rsa-sha2-512") == 0)
+		return SSH_DIGEST_SHA512;
+	return -1;
+}
+
+/*
+ * Return the hash algorithm ID for the specified key name. This includes
+ * all the cases of rsa_hash_id_from_ident() but also the certificate key
+ * types.
+ */
+static int
+rsa_hash_id_from_keyname(const char *alg)
+{
+	int r;
+
+	if ((r = rsa_hash_id_from_ident(alg)) != -1)
+		return r;
+	if (strcmp(alg, "ssh-rsa-cert-v01@openssh.com") == 0)
+		return SSH_DIGEST_SHA1;
+	if (strcmp(alg, "rsa-sha2-256-cert-v01@openssh.com") == 0)
+		return SSH_DIGEST_SHA256;
+	if (strcmp(alg, "rsa-sha2-512-cert-v01@openssh.com") == 0)
 		return SSH_DIGEST_SHA512;
 	return -1;
 }
@@ -74,13 +98,12 @@ rsa_hash_alg_nid(int type)
 	}
 }
 
-/* calculate p-1 and q-1 */
 int
 ssh_rsa_generate_additional_parameters(struct sshkey *key)
 {
-	RSA *rsa;
 	BIGNUM *aux = NULL;
 	BN_CTX *ctx = NULL;
+	BIGNUM d;
 	int r;
 
 	if (key == NULL || key->rsa == NULL ||
@@ -93,12 +116,15 @@ ssh_rsa_generate_additional_parameters(struct sshkey *key)
 		r = SSH_ERR_ALLOC_FAIL;
 		goto out;
 	}
-	rsa = key->rsa;
+	BN_set_flags(aux, BN_FLG_CONSTTIME);
 
-	if ((BN_sub(aux, rsa->q, BN_value_one()) == 0) ||
-	    (BN_mod(rsa->dmq1, rsa->d, aux, ctx) == 0) ||
-	    (BN_sub(aux, rsa->p, BN_value_one()) == 0) ||
-	    (BN_mod(rsa->dmp1, rsa->d, aux, ctx) == 0)) {
+	BN_init(&d);
+	BN_with_flags(&d, key->rsa->d, BN_FLG_CONSTTIME);
+
+	if ((BN_sub(aux, key->rsa->q, BN_value_one()) == 0) ||
+	    (BN_mod(key->rsa->dmq1, &d, aux, ctx) == 0) ||
+	    (BN_sub(aux, key->rsa->p, BN_value_one()) == 0) ||
+	    (BN_mod(key->rsa->dmp1, &d, aux, ctx) == 0)) {
 		r = SSH_ERR_LIBCRYPTO_ERROR;
 		goto out;
 	}
@@ -115,7 +141,7 @@ ssh_rsa_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,
     const u_char *data, size_t datalen, const char *alg_ident)
 {
 	u_char digest[SSH_DIGEST_MAX_LENGTH], *sig = NULL;
-	size_t slen;
+	size_t slen = 0;
 	u_int dlen, len;
 	int nid, hash_alg, ret = SSH_ERR_INTERNAL_ERROR;
 	struct sshbuf *b = NULL;
@@ -128,7 +154,7 @@ ssh_rsa_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,
 	if (alg_ident == NULL || strlen(alg_ident) == 0)
 		hash_alg = SSH_DIGEST_SHA1;
 	else
-		hash_alg = rsa_hash_alg_from_ident(alg_ident);
+		hash_alg = rsa_hash_id_from_keyname(alg_ident);
 	if (key == NULL || key->rsa == NULL || hash_alg == -1 ||
 	    sshkey_type_plain(key->type) != KEY_RSA)
 		return SSH_ERR_INVALID_ARGUMENT;
@@ -184,10 +210,7 @@ ssh_rsa_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,
 	ret = 0;
  out:
 	explicit_bzero(digest, sizeof(digest));
-	if (sig != NULL) {
-		explicit_bzero(sig, slen);
-		free(sig);
-	}
+	freezero(sig, slen);
 	sshbuf_free(b);
 	return ret;
 }
@@ -198,8 +221,8 @@ ssh_rsa_verify(const struct sshkey *key,
     const char *alg)
 {
 	char *sigtype = NULL;
-	int hash_alg, ret = SSH_ERR_INTERNAL_ERROR;
-	size_t len, diff, modlen, dlen;
+	int hash_alg, want_alg, ret = SSH_ERR_INTERNAL_ERROR;
+	size_t len = 0, diff, modlen, dlen;
 	struct sshbuf *b = NULL;
 	u_char digest[SSH_DIGEST_MAX_LENGTH], *osigblob, *sigblob = NULL;
 
@@ -216,17 +239,23 @@ ssh_rsa_verify(const struct sshkey *key,
 		ret = SSH_ERR_INVALID_FORMAT;
 		goto out;
 	}
-	/* XXX djm: need cert types that reliably yield SHA-2 signatures */
-	if (alg != NULL && strcmp(alg, sigtype) != 0 &&
-	    strcmp(alg, "ssh-rsa-cert-v01@openssh.com") != 0) {
-		error("%s: RSA signature type mismatch: "
-		    "expected %s received %s", __func__, alg, sigtype);
-		ret = SSH_ERR_SIGNATURE_INVALID;
-		goto out;
-	}
-	if ((hash_alg = rsa_hash_alg_from_ident(sigtype)) == -1) {
+	if ((hash_alg = rsa_hash_id_from_ident(sigtype)) == -1) {
 		ret = SSH_ERR_KEY_TYPE_MISMATCH;
 		goto out;
+	}
+	/*
+	 * Allow ssh-rsa-cert-v01 certs to generate SHA2 signatures for
+	 * legacy reasons, but otherwise the signature type should match.
+	 */
+	if (alg != NULL && strcmp(alg, "ssh-rsa-cert-v01@openssh.com") != 0) {
+		if ((want_alg = rsa_hash_id_from_keyname(alg)) == -1) {
+			ret = SSH_ERR_INVALID_ARGUMENT;
+			goto out;
+		}
+		if (hash_alg != want_alg) {
+			ret = SSH_ERR_SIGNATURE_INVALID;
+			goto out;
+		}
 	}
 	if (sshbuf_get_string(b, &sigblob, &len) != 0) {
 		ret = SSH_ERR_INVALID_FORMAT;
@@ -264,10 +293,7 @@ ssh_rsa_verify(const struct sshkey *key,
 	ret = openssh_RSA_verify(hash_alg, digest, dlen, sigblob, len,
 	    key->rsa);
  out:
-	if (sigblob != NULL) {
-		explicit_bzero(sigblob, len);
-		free(sigblob);
-	}
+	freezero(sigblob, len);
 	free(sigtype);
 	sshbuf_free(b);
 	explicit_bzero(digest, sizeof(digest));
@@ -389,9 +415,6 @@ openssh_RSA_verify(int hash_alg, u_char *hash, size_t hashlen,
 	}
 	ret = 0;
 done:
-	if (decrypted) {
-		explicit_bzero(decrypted, rsasize);
-		free(decrypted);
-	}
+	freezero(decrypted, rsasize);
 	return ret;
 }

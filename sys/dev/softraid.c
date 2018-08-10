@@ -1,4 +1,4 @@
-/* $OpenBSD: softraid.c,v 1.389 2017/12/21 07:29:15 tb Exp $ */
+/* $OpenBSD: softraid.c,v 1.392 2018/05/02 02:24:55 visa Exp $ */
 /*
  * Copyright (c) 2007, 2008, 2009 Marco Peereboom <marco@peereboom.us>
  * Copyright (c) 2008 Chris Kuethe <ckuethe@openbsd.org>
@@ -1532,13 +1532,8 @@ sr_map_root(void)
 					memcpy(rootduid, sbm->sbm_root_duid,
 					    sizeof(rootduid));
 					DNPRINTF(SR_D_MISC, "%s: root duid "
-					    "mapped to %02x%02x%02x%02x"
-					    "%02x%02x%02x%02x\n",
-					    DEVNAME(sc), rootduid[0],
-					    rootduid[1], rootduid[2],
-					    rootduid[3], rootduid[4],
-					    rootduid[5], rootduid[6],
-					    rootduid[7]);
+					    "mapped to %s\n", DEVNAME(sc),
+					    duid_format(rootduid));
 					return;
 				}
 			}
@@ -3760,11 +3755,8 @@ sr_ioctl_installboot(struct sr_softc *sc, struct sr_discipline *sd,
 	sbm->sbm_bootblk_size = bbs;
 	sbm->sbm_bootldr_size = bls;
 
-	DNPRINTF(SR_D_IOCTL, "sr_ioctl_installboot: root duid is "
-	    "%02x%02x%02x%02x%02x%02x%02x%02x\n", sbm->sbm_root_duid[0],
-	    sbm->sbm_root_duid[1], sbm->sbm_root_duid[2], sbm->sbm_root_duid[3],
-	    sbm->sbm_root_duid[4], sbm->sbm_root_duid[5], sbm->sbm_root_duid[6],
-	    sbm->sbm_root_duid[7]);
+	DNPRINTF(SR_D_IOCTL, "sr_ioctl_installboot: root duid is %s\n",
+	    duid_format(sbm->sbm_root_duid));
 
 	/* Save boot block and boot loader to each chunk. */
 	for (i = 0; i < sd->sd_meta->ssdi.ssd_chunk_no; i++) {
@@ -3840,8 +3832,7 @@ sr_chunks_unwind(struct sr_softc *sc, struct sr_chunk_head *cl)
 			 * the problem introduced by vnode aliasing... specfs
 			 * has no locking, whereas ufs/ffs does!
 			 */
-			vn_lock(ch_entry->src_vn, LK_EXCLUSIVE |
-			    LK_RETRY, curproc);
+			vn_lock(ch_entry->src_vn, LK_EXCLUSIVE | LK_RETRY);
 			VOP_CLOSE(ch_entry->src_vn, FREAD | FWRITE, NOCRED,
 			    curproc);
 			vput(ch_entry->src_vn);
@@ -3929,6 +3920,12 @@ sr_discipline_shutdown(struct sr_discipline *sd, int meta_save, int dying)
 		if (tsleep(&sd->sd_sync, MAXPRI, "sr_down", 60 * hz) ==
 		    EWOULDBLOCK)
 			break;
+
+	if (dying == -1) {
+		sd->sd_ready = 1;
+		splx(s);
+		return;
+	}
 
 #ifndef SMALL_KERNEL
 	sr_sensors_delete(sd);
@@ -4540,6 +4537,18 @@ sr_validate_stripsize(u_int32_t b)
 		return(-1);
 
 	return (s);
+}
+
+void
+sr_quiesce(void)
+{
+	struct sr_softc		*sc = softraid0;
+	struct sr_discipline	*sd, *nsd;
+
+	/* Shutdown disciplines in reverse attach order. */
+	TAILQ_FOREACH_REVERSE_SAFE(sd, &sc->sc_dis_list,
+	    sr_discipline_list, sd_link, nsd)
+		sr_discipline_shutdown(sd, 1, -1);
 }
 
 void

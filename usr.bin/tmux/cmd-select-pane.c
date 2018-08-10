@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-select-pane.c,v 1.42 2017/11/17 09:52:18 nicm Exp $ */
+/* $OpenBSD: cmd-select-pane.c,v 1.44 2018/06/25 17:23:16 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -69,6 +69,11 @@ cmd_select_pane_exec(struct cmd *self, struct cmdq_item *item)
 
 	if (self->entry == &cmd_last_pane_entry || args_has(args, 'l')) {
 		lastwp = w->last;
+		if (lastwp == NULL && window_count_panes(w) == 2) {
+			lastwp = TAILQ_PREV(w->active, window_panes, entry);
+			if (lastwp == NULL)
+				lastwp = TAILQ_NEXT(w->active, entry);
+		}
 		if (lastwp == NULL) {
 			cmdq_error(item, "no last pane");
 			return (CMD_RETURN_ERROR);
@@ -157,6 +162,7 @@ cmd_select_pane_exec(struct cmd *self, struct cmdq_item *item)
 		screen_set_title(&wp->base, pane_title);
 		server_status_window(wp->window);
 		free(pane_title);
+		return (CMD_RETURN_NORMAL);
 	}
 
 	if (wp == w->active)

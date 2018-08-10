@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_subr.c,v 1.265 2017/12/14 20:23:15 deraadt Exp $	*/
+/*	$OpenBSD: vfs_subr.c,v 1.277 2018/07/13 09:25:23 beck Exp $	*/
 /*	$NetBSD: vfs_subr.c,v 1.53 1996/04/22 01:39:13 christos Exp $	*/
 
 /*
@@ -72,7 +72,7 @@
 
 #include "softraid.h"
 
-void sr_shutdown(int);
+void sr_quiesce(void);
 
 enum vtype iftovt_tab[16] = {
 	VNON, VFIFO, VCHR, VNON, VDIR, VNON, VBLK, VNON,
@@ -114,6 +114,8 @@ void vputonfreelist(struct vnode *);
 
 int vflush_vnode(struct vnode *, void *);
 int maxvnodes;
+
+void vfs_unmountall(void);
 
 #ifdef DEBUG
 void printlockedvnodes(void);
@@ -185,6 +187,11 @@ vfs_busy(struct mount *mp, int flags)
 		rwflags |= RW_SLEEPFAIL;
 	else
 		rwflags |= RW_NOSLEEP;
+
+#ifdef WITNESS
+	if (flags & VB_DUPOK)
+		rwflags |= RW_DUPOK;
+#endif
 
 	if (rw_enter(&mp->mnt_lock, rwflags))
 		return (EBUSY);
@@ -538,7 +545,7 @@ loop:
 			vgonel(vp, p);
 			goto loop;
 		}
-		if (vget(vp, LK_EXCLUSIVE, p)) {
+		if (vget(vp, LK_EXCLUSIVE)) {
 			goto loop;
 		}
 		break;
@@ -585,7 +592,7 @@ loop:
 	 * The vnodes created by bdevvp should not be aliased (why?).
 	 */
 
-	VOP_UNLOCK(vp, p);
+	VOP_UNLOCK(vp);
 	vclean(vp, 0, p);
 	vp->v_op = nvp->v_op;
 	vp->v_tag = nvp->v_tag;
@@ -604,7 +611,7 @@ loop:
  * having been changed to a new file system type.
  */
 int
-vget(struct vnode *vp, int flags, struct proc *p)
+vget(struct vnode *vp, int flags)
 {
 	int error, s, onfreelist;
 
@@ -638,7 +645,7 @@ vget(struct vnode *vp, int flags, struct proc *p)
 
  	vp->v_usecount++;
 	if (flags & LK_TYPE_MASK) {
-		if ((error = vn_lock(vp, flags, p)) != 0) {
+		if ((error = vn_lock(vp, flags)) != 0) {
 			vp->v_usecount--;
 			if (vp->v_usecount == 0 && onfreelist)
 				vputonfreelist(vp);
@@ -715,8 +722,9 @@ vput(struct vnode *vp)
 	}
 #endif
 	vp->v_usecount--;
+	KASSERT(vp->v_usecount > 0 || vp->v_uvcount == 0);
 	if (vp->v_usecount > 0) {
-		VOP_UNLOCK(vp, p);
+		VOP_UNLOCK(vp);
 		return;
 	}
 
@@ -765,7 +773,7 @@ vrele(struct vnode *vp)
 	}
 #endif
 
-	if (vn_lock(vp, LK_EXCLUSIVE, p)) {
+	if (vn_lock(vp, LK_EXCLUSIVE)) {
 #ifdef DIAGNOSTIC
 		vprint("vrele: cannot lock", vp);
 #endif
@@ -968,7 +976,7 @@ vclean(struct vnode *vp, int flags, struct proc *p)
 	 * For active vnodes, it ensures that no other activity can
 	 * occur while the underlying object is being cleaned out.
 	 */
-	VOP_LOCK(vp, LK_DRAIN | LK_EXCLUSIVE, p);
+	VOP_LOCK(vp, LK_DRAIN | LK_EXCLUSIVE);
 
 	/*
 	 * Clean out any VM data associated with the vnode.
@@ -993,7 +1001,7 @@ vclean(struct vnode *vp, int flags, struct proc *p)
 		 * Any other processes trying to obtain this lock must first
 		 * wait for VXLOCK to clear, then call the new lock operation.
 		 */
-		VOP_UNLOCK(vp, p);
+		VOP_UNLOCK(vp);
 	}
 
 	/*
@@ -1059,6 +1067,8 @@ vgonel(struct vnode *vp, struct proc *p)
 {
 	struct vnode *vq;
 	struct vnode *vx;
+
+	KASSERT(vp->v_uvcount == 0);
 
 	/*
 	 * If a vgone (or vclean) is already in progress,
@@ -1583,53 +1593,91 @@ vaccess(enum vtype type, mode_t file_mode, uid_t uid, gid_t gid,
 	return (file_mode & mask) == mask ? 0 : EACCES;
 }
 
+struct rwlock vfs_stall_lock = RWLOCK_INITIALIZER("vfs_stall");
+
 int
-vfs_readonly(struct mount *mp, struct proc *p)
+vfs_stall(struct proc *p, int stall)
 {
-	int error;
+	struct mount *mp;
+	int allerror = 0, error;
 
-	error = vfs_busy(mp, VB_WRITE|VB_WAIT);
-	if (error) {
-		printf("%s: busy\n", mp->mnt_stat.f_mntonname);
-		return (error);
-	}
-	uvm_vnp_sync(mp);
-	error = VFS_SYNC(mp, MNT_WAIT, p->p_ucred, p);
-	if (error) {
-		printf("%s: failed to sync\n", mp->mnt_stat.f_mntonname);
-		vfs_unbusy(mp);
-		return (error);
+	if (stall)
+		rw_enter_write(&vfs_stall_lock);
+
+	/*
+	 * The loop variable mp is protected by vfs_busy() so that it cannot
+	 * be unmounted while VFS_SYNC() sleeps.  Traverse forward to keep the
+	 * lock order consistent with dounmount().
+	 */
+	TAILQ_FOREACH(mp, &mountlist, mnt_list) {
+		if (stall) {
+			error = vfs_busy(mp, VB_WRITE|VB_WAIT|VB_DUPOK);
+			if (error) {
+				printf("%s: busy\n", mp->mnt_stat.f_mntonname);
+				allerror = error;
+				continue;
+			}
+			uvm_vnp_sync(mp);
+			error = VFS_SYNC(mp, MNT_WAIT, stall, p->p_ucred, p);
+			if (error) {
+				printf("%s: failed to sync\n", mp->mnt_stat.f_mntonname);
+				vfs_unbusy(mp);
+				allerror = error;
+				continue;
+			}
+			mp->mnt_flag |= MNT_STALLED;
+		} else {
+			if (mp->mnt_flag & MNT_STALLED) {
+				vfs_unbusy(mp);
+				mp->mnt_flag &= ~MNT_STALLED;
+			}
+		}
 	}
 
-	mp->mnt_flag |= MNT_UPDATE | MNT_RDONLY;
-	mp->mnt_flag &= ~MNT_SOFTDEP;
-	error = VFS_MOUNT(mp, mp->mnt_stat.f_mntonname, NULL, NULL, curproc);
-	if (error) {
-		printf("%s: failed to remount rdonly, error %d\n",
-		    mp->mnt_stat.f_mntonname, error);
-		vfs_unbusy(mp);
-		return (error);
-	}
-	if (mp->mnt_syncer != NULL)
-		vgone(mp->mnt_syncer);
-	mp->mnt_syncer = NULL;
-	vfs_unbusy(mp);
-	return (error);
+	if (!stall)
+		rw_exit_write(&vfs_stall_lock);
+
+	return (allerror);
+}
+
+void
+vfs_stall_barrier(void)
+{
+	rw_enter_read(&vfs_stall_lock);
+	rw_exit_read(&vfs_stall_lock);
 }
 
 /*
- * Read-only all file systems.
+ * Unmount all file systems.
  * We traverse the list in reverse order under the assumption that doing so
  * will avoid needing to worry about dependencies.
  */
 void
-vfs_rofs(struct proc *p)
+vfs_unmountall(void)
 {
 	struct mount *mp, *nmp;
+	int allerror, error, again = 1;
 
+ retry:
+	allerror = 0;
 	TAILQ_FOREACH_REVERSE_SAFE(mp, &mountlist, mntlist, mnt_list, nmp) {
+		if (vfs_busy(mp, VB_WRITE|VB_NOWAIT))
+			continue;
 		/* XXX Here is a race, the next pointer is not locked. */
-		(void) vfs_readonly(mp, p);
+		if ((error = dounmount(mp, MNT_FORCE, curproc)) != 0) {
+			printf("unmount of %s failed with error %d\n",
+			    mp->mnt_stat.f_mntonname, error);
+			allerror = 1;
+		}
+	}
+
+	if (allerror) {
+		printf("WARNING: some file systems would not unmount\n");
+		if (again) {
+			printf("retrying\n");
+			again = 0;
+			goto retry;
+		}
 	}
 }
 
@@ -1646,19 +1694,19 @@ vfs_shutdown(struct proc *p)
 	printf("syncing disks... ");
 
 	if (panicstr == 0) {
-		/* Take all filesystems to read-only */
+		/* Sync before unmount, in case we hang on something. */
 		sys_sync(p, NULL, NULL);
-		vfs_rofs(p);
+		vfs_unmountall();
 	}
+
+#if NSOFTRAID > 0
+	sr_quiesce();
+#endif
 
 	if (vfs_syncwait(p, 1))
 		printf("giving up\n");
 	else
 		printf("done\n");
-
-#if NSOFTRAID > 0
-	sr_shutdown(1);
-#endif
 }
 
 /*
@@ -1824,7 +1872,7 @@ vinvalbuf(struct vnode *vp, int flags, struct ucred *cred, struct proc *p,
 
 #ifdef VFSLCKDEBUG
 	if ((vp->v_flag & VLOCKSWORK) && !VOP_ISLOCKED(vp))
-		panic("vinvalbuf(): vp isn't locked");
+		panic("%s: vp isn't locked, vp %p", __func__, vp);
 #endif
 
 	if (flags & V_SAVE) {
@@ -1837,7 +1885,7 @@ vinvalbuf(struct vnode *vp, int flags, struct ucred *cred, struct proc *p,
 			s = splbio();
 			if (vp->v_numoutput > 0 ||
 			    !LIST_EMPTY(&vp->v_dirtyblkhd))
-				panic("vinvalbuf: dirty bufs");
+				panic("%s: dirty bufs, vp %p", __func__, vp);
 		}
 		splx(s);
 	}
@@ -1889,7 +1937,7 @@ loop:
 	}
 	if (!(flags & V_SAVEMETA) &&
 	    (!LIST_EMPTY(&vp->v_dirtyblkhd) || !LIST_EMPTY(&vp->v_cleanblkhd)))
-		panic("vinvalbuf: flush failed");
+		panic("%s: flush failed, vp %p", __func__, vp);
 	splx(s);
 	return (0);
 }
@@ -1980,7 +2028,7 @@ brelvp(struct buf *bp)
 	if (LIST_NEXT(bp, b_vnbufs) != NOLIST)
 		bufremvn(bp);
 	if ((vp->v_bioflag & VBIOONSYNCLIST) &&
-	    LIST_FIRST(&vp->v_dirtyblkhd) == NULL) {
+	    LIST_EMPTY(&vp->v_dirtyblkhd)) {
 		vp->v_bioflag &= ~VBIOONSYNCLIST;
 		LIST_REMOVE(vp, v_synclist);
 	}
@@ -2046,7 +2094,7 @@ reassignbuf(struct buf *bp)
 	if ((bp->b_flags & B_DELWRI) == 0) {
 		listheadp = &vp->v_cleanblkhd;
 		if ((vp->v_bioflag & VBIOONSYNCLIST) &&
-		    LIST_FIRST(&vp->v_dirtyblkhd) == NULL) {
+		    LIST_EMPTY(&vp->v_dirtyblkhd)) {
 			vp->v_bioflag &= ~VBIOONSYNCLIST;
 			LIST_REMOVE(vp, v_synclist);
 		}

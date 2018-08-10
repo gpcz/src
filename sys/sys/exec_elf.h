@@ -1,4 +1,4 @@
-/*	$OpenBSD: exec_elf.h,v 1.78 2017/12/09 06:35:08 deraadt Exp $	*/
+/*	$OpenBSD: exec_elf.h,v 1.80 2018/01/22 09:01:39 mpi Exp $	*/
 /*
  * Copyright (c) 1995, 1996 Erik Theisen.  All rights reserved.
  *
@@ -247,19 +247,20 @@ typedef struct {
 #define SHN_HIRESERVE	0xffff		/* upper bounds of reserved indexes */
 
 /* sh_type */
-#define SHT_NULL	0		/* inactive */
-#define SHT_PROGBITS	1		/* program defined information */
-#define SHT_SYMTAB	2		/* symbol table section */
-#define SHT_STRTAB	3		/* string table section */
-#define SHT_RELA	4		/* relocation section with addends*/
-#define SHT_HASH	5		/* symbol hash table section */
-#define SHT_DYNAMIC	6		/* dynamic section */
-#define SHT_NOTE	7		/* note section */
-#define SHT_NOBITS	8		/* no space section */
-#define SHT_REL		9		/* relation section without addends */
-#define SHT_SHLIB	10		/* reserved - purpose unknown */
-#define SHT_DYNSYM	11		/* dynamic symbol table section */
-#define SHT_NUM		12		/* number of section types */
+#define SHT_NULL		0	/* inactive */
+#define SHT_PROGBITS		1	/* program defined information */
+#define SHT_SYMTAB		2	/* symbol table section */
+#define SHT_STRTAB		3	/* string table section */
+#define SHT_RELA		4	/* relocation section with addends*/
+#define SHT_HASH		5	/* symbol hash table section */
+#define SHT_DYNAMIC		6	/* dynamic section */
+#define SHT_NOTE		7	/* note section */
+#define SHT_NOBITS		8	/* no space section */
+#define SHT_REL			9	/* relation section without addends */
+#define SHT_SHLIB		10	/* reserved - purpose unknown */
+#define SHT_DYNSYM		11	/* dynamic symbol table section */
+#define SHT_NUM			12	/* number of section types */
+#define SHT_SYMTAB_SHNDX	18	/* Section indexes (see SHN_XINDEX). */
 #define SHT_LOPROC	0x70000000	/* reserved range for processor */
 #define SHT_HIPROC	0x7fffffff	/*  specific section header types */
 #define SHT_LOUSER	0x80000000	/* reserved range for application */
@@ -355,6 +356,16 @@ typedef struct {
 #define STT_TLS		6		/* thread local storage */
 #define STT_LOPROC	13		/* reserved range for processor */
 #define STT_HIPROC	15		/*  specific symbol types */
+
+/* Extract symbol visibility - st_other */
+#define ELF_ST_VISIBILITY(v)		((v) & 0x3)
+#define ELF32_ST_VISIBILITY		ELF_ST_VISIBILITY
+#define ELF64_ST_VISIBILITY		ELF_ST_VISIBILITY
+
+#define STV_DEFAULT	0		/* Visibility set by binding type */
+#define STV_INTERNAL	1		/* OS specific version of STV_HIDDEN */
+#define STV_HIDDEN	2		/* can only be seen inside own .so */
+#define STV_PROTECTED	3		/* HIDDEN inside, DEFAULT outside */
 
 /* Relocation entry with implicit addend */
 typedef struct {

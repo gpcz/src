@@ -1,4 +1,4 @@
-/*	$OpenBSD: _endian.h,v 1.4 2018/01/03 23:20:10 dlg Exp $	*/
+/*	$OpenBSD: _endian.h,v 1.8 2018/01/11 23:13:37 dlg Exp $	*/
 
 /*-
  * Copyright (c) 1997 Niklas Hallqvist.  All rights reserved.
@@ -64,28 +64,31 @@
 	    ((__uint64_t)(x) & 0xff00000000000000ULL) >> 56)
 
 #ifndef __HAVE_MD_SWAP
-static inline __uint16_t
+static __inline __uint16_t
 __swap16md(__uint16_t x)
 {
 	return (__swap16gen(x));
 }
 
-static inline __uint32_t
+static __inline __uint32_t
 __swap32md(__uint32_t x)
 {
 	return (__swap32gen(x));
 }
 
-static inline __uint64_t
+static __inline __uint64_t
 __swap64md(__uint64_t x)
 {
 	return (__swap64gen(x));
 }
 #endif
 
-#define __swap16(x) (__builtin_constant_p(x) ? __swap16gen(x) : __swap16md(x))
-#define __swap32(x) (__builtin_constant_p(x) ? __swap32gen(x) : __swap32md(x))
-#define __swap64(x) (__builtin_constant_p(x) ? __swap64gen(x) : __swap64md(x))
+#define __swap16(x)							\
+	(__uint16_t)(__builtin_constant_p(x) ? __swap16gen(x) : __swap16md(x))
+#define __swap32(x)							\
+	(__uint32_t)(__builtin_constant_p(x) ? __swap32gen(x) : __swap32md(x))
+#define __swap64(x)							\
+	(__uint64_t)(__builtin_constant_p(x) ? __swap64gen(x) : __swap64md(x))
 
 #if _BYTE_ORDER == _LITTLE_ENDIAN
 

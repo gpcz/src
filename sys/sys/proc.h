@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.h,v 1.244 2017/12/19 10:04:59 stefan Exp $	*/
+/*	$OpenBSD: proc.h,v 1.255 2018/08/05 14:23:57 beck Exp $	*/
 /*	$NetBSD: proc.h,v 1.44 1996/04/22 01:23:21 christos Exp $	*/
 
 /*-
@@ -48,6 +48,8 @@
 #include <sys/event.h>			/* For struct klist */
 #include <sys/mutex.h>			/* For struct mutex */
 #include <sys/resource.h>		/* For struct rusage */
+#include <sys/rwlock.h>			/* For struct rwlock */
+#include <sys/tree.h>
 
 #ifdef _KERNEL
 #include <sys/atomic.h>
@@ -94,8 +96,6 @@ union sigval;
 struct	emul {
 	char	e_name[8];		/* Symbolic name */
 	int	*e_errno;		/* Errno array */
-					/* Signal sending function */
-	void	(*e_sendsig)(void (*)(int), int, int, u_long, int, union sigval);
 	int	e_nosys;		/* Offset of the nosys() syscall */
 	int	e_nsysent;		/* Number of system call entries */
 	struct sysent *e_sysent;	/* System call array */
@@ -112,12 +112,8 @@ struct	emul {
 	char	*e_sigcode;		/* Start of sigcode */
 	char	*e_esigcode;		/* End of sigcode */
 	char	*e_esigret;		/* sigaction RET position */
-	int	e_flags;		/* Flags, see below */
 	struct uvm_object *e_sigobject;	/* shared sigcode object */
 };
-/* Flags for e_flags */
-#define	EMUL_ENABLED	0x0001		/* Allow exec to continue */
-#define	EMUL_NATIVE	0x0002		/* Always enabled */
 
 /*
  * time usage: accumulated times in ticks
@@ -130,6 +126,15 @@ struct tusage {
 	uint64_t	tu_sticks;	/* Statclock hits in system mode. */
 	uint64_t	tu_iticks;	/* Statclock hits processing intr. */
 };
+
+struct unvname {
+	char 			*un_name;
+	size_t 			un_namesize;
+	u_char			un_flags;
+	RBT_ENTRY(unvnmae)	un_rbt;
+};
+
+RBT_HEAD(unvname_rbt, unvname);
 
 /*
  * Description of a process.
@@ -144,6 +149,7 @@ struct tusage {
  * run-time information needed by threads.
  */
 #ifdef __need_process
+struct unveil;
 struct process {
 	/*
 	 * ps_mainproc is the original thread in the process.
@@ -168,6 +174,8 @@ struct process {
 	struct	vmspace *ps_vmspace;	/* Address space */
 	pid_t	ps_pid;			/* Process identifier. */
 
+	LIST_HEAD(, kqueue) ps_kqlist;	/* kqueues attached to this process */
+
 /* The following fields are all zeroed upon creation in process_new. */
 #define	ps_startzero	ps_klist
 	struct	klist ps_klist;		/* knotes attached to this process */
@@ -190,6 +198,14 @@ struct process {
 	struct	itimerval ps_timer[3];	/* timers, indexed by ITIMER_* */
 
 	u_int64_t ps_wxcounter;
+
+	struct unveil *ps_uvpaths;	/* unveil vnodes and names */
+	struct unveil *ps_uvpcwd;	/* pointer to unveil of cwd, NULL if none */
+	size_t ps_uvvcount;		/* count of unveil vnodes held */
+	size_t ps_uvncount;		/* count of unveil names allocated */
+	int ps_uvshrink;		/* do we need to shrink vnode list */
+	int ps_uvdone;			/* no more unveil is permitted */
+	int ps_uvpcwdgone;		/* need to reevaluate cwd unveil */
 
 /* End area that is zeroed on creation. */
 #define	ps_endzero	ps_startcopy
@@ -330,6 +346,10 @@ struct proc {
 #define	p_startcopy	p_sigmask
 	sigset_t p_sigmask;	/* Current signal mask. */
 
+	u_int	 p_spserial;
+	vaddr_t	 p_spstart;
+	vaddr_t	 p_spend;
+
 	u_char	p_priority;	/* Process priority. */
 	u_char	p_usrpri;	/* User-priority based on p_estcpu and ps_nice. */
 	int	p_pledge_syscall;	/* Cache of current syscall */
@@ -400,6 +420,13 @@ struct proc {
 
 #ifdef _KERNEL
 
+struct unveil {
+	struct vnode		*uv_vp;
+	struct unvname_rbt	uv_names;
+	struct rwlock		uv_lock;
+	u_char			uv_flags;
+};
+
 struct uidinfo {
 	LIST_ENTRY(uidinfo) ui_hash;
 	uid_t   ui_uid;
@@ -408,6 +435,7 @@ struct uidinfo {
 };
 
 struct uidinfo *uid_find(uid_t);
+void uid_release(struct uidinfo *);
 
 /*
  * We use process IDs <= PID_MAX; PID_MAX + 1 must also fit in a pid_t,
@@ -496,12 +524,12 @@ void	proc_printit(struct proc *p, const char *modif,
     int (*pr)(const char *, ...));
 
 int	chgproccnt(uid_t uid, int diff);
-int	enterpgrp(struct process *, pid_t, struct pgrp *, struct session *);
-void	fixjobc(struct process *, struct pgrp *, int);
+void	enternewpgrp(struct process *, struct pgrp *, struct session *);
+void	enterthispgrp(struct process *, struct pgrp *);
 int	inferior(struct process *, struct process *);
 void	leavepgrp(struct process *);
+void	killjobc(struct process *);
 void	preempt(void);
-void	pgdelete(struct pgrp *);
 void	procinit(void);
 void	resetpriority(struct proc *);
 void	setrunnable(struct proc *);
@@ -589,6 +617,7 @@ void cpuset_copy(struct cpuset *, struct cpuset *);
 void cpuset_union(struct cpuset *, struct cpuset *, struct cpuset *);
 void cpuset_intersection(struct cpuset *t, struct cpuset *, struct cpuset *);
 void cpuset_complement(struct cpuset *, struct cpuset *, struct cpuset *);
+int cpuset_cardinality(struct cpuset *);
 struct cpu_info *cpuset_first(struct cpuset *);
 
 #endif	/* _KERNEL */

@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.293 2017/10/23 05:08:00 djm Exp $ */
+/* $OpenBSD: session.c,v 1.305 2018/07/25 13:56:23 deraadt Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -60,12 +60,13 @@
 #include "ssh2.h"
 #include "sshpty.h"
 #include "packet.h"
-#include "buffer.h"
+#include "sshbuf.h"
+#include "ssherr.h"
 #include "match.h"
 #include "uidswap.h"
 #include "compat.h"
 #include "channels.h"
-#include "key.h"
+#include "sshkey.h"
 #include "cipher.h"
 #include "kex.h"
 #include "hostfile.h"
@@ -123,7 +124,8 @@ extern int debug_flag;
 extern u_int utmp_len;
 extern int startup_pipe;
 extern void destroy_sensitive_data(void);
-extern Buffer loginmsg;
+extern struct sshbuf *loginmsg;
+extern struct sshauthopt *auth_opts;
 char *tun_fwd_ifnames; /* serverloop.c */
 
 /* original command from peer. */
@@ -229,11 +231,14 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd * pw)
 static void
 display_loginmsg(void)
 {
-	if (buffer_len(&loginmsg) > 0) {
-		buffer_append(&loginmsg, "\0", 1);
-		printf("%s", (char *)buffer_ptr(&loginmsg));
-		buffer_clear(&loginmsg);
-	}
+	int r;
+
+	if (sshbuf_len(loginmsg) == 0)
+		return;
+	if ((r = sshbuf_put_u8(loginmsg, 0)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	printf("%s", (char *)sshbuf_ptr(loginmsg));
+	sshbuf_reset(loginmsg);
 }
 
 static void
@@ -270,19 +275,72 @@ prepare_auth_info_file(struct passwd *pw, struct sshbuf *info)
 	restore_uid();
 }
 
+static void
+set_fwdpermit_from_authopts(struct ssh *ssh, const struct sshauthopt *opts)
+{
+	char *tmp, *cp, *host;
+	int port;
+	size_t i;
+
+	if ((options.allow_tcp_forwarding & FORWARD_LOCAL) != 0) {
+		channel_clear_permission(ssh, FORWARD_USER, FORWARD_LOCAL);
+		for (i = 0; i < auth_opts->npermitopen; i++) {
+			tmp = cp = xstrdup(auth_opts->permitopen[i]);
+			/* This shouldn't fail as it has already been checked */
+			if ((host = hpdelim(&cp)) == NULL)
+				fatal("%s: internal error: hpdelim", __func__);
+			host = cleanhostname(host);
+			if (cp == NULL || (port = permitopen_port(cp)) < 0)
+				fatal("%s: internal error: permitopen port",
+				    __func__);
+			channel_add_permission(ssh,
+			    FORWARD_USER, FORWARD_LOCAL, host, port);
+			free(tmp);
+		}
+	}
+	if ((options.allow_tcp_forwarding & FORWARD_REMOTE) != 0) {
+		channel_clear_permission(ssh, FORWARD_USER, FORWARD_REMOTE);
+		for (i = 0; i < auth_opts->npermitlisten; i++) {
+			tmp = cp = xstrdup(auth_opts->permitlisten[i]);
+			/* This shouldn't fail as it has already been checked */
+			if ((host = hpdelim(&cp)) == NULL)
+				fatal("%s: internal error: hpdelim", __func__);
+			host = cleanhostname(host);
+			if (cp == NULL || (port = permitopen_port(cp)) < 0)
+				fatal("%s: internal error: permitlisten port",
+				    __func__);
+			channel_add_permission(ssh,
+			    FORWARD_USER, FORWARD_REMOTE, host, port);
+			free(tmp);
+		}
+	}
+}
+
 void
 do_authenticated(struct ssh *ssh, Authctxt *authctxt)
 {
 	setproctitle("%s", authctxt->pw->pw_name);
 
+	auth_log_authopts("active", auth_opts, 0);
+
 	/* setup the channel layer */
 	/* XXX - streamlocal? */
-	if (no_port_forwarding_flag || options.disable_forwarding ||
-	    (options.allow_tcp_forwarding & FORWARD_LOCAL) == 0)
-		channel_disable_adm_local_opens(ssh);
-	else
-		channel_permit_all_opens(ssh);
+	set_fwdpermit_from_authopts(ssh, auth_opts);
 
+	if (!auth_opts->permit_port_forwarding_flag ||
+	    options.disable_forwarding) {
+		channel_disable_admin(ssh, FORWARD_LOCAL);
+		channel_disable_admin(ssh, FORWARD_REMOTE);
+	} else {
+		if ((options.allow_tcp_forwarding & FORWARD_LOCAL) == 0)
+			channel_disable_admin(ssh, FORWARD_LOCAL);
+		else
+			channel_permit_all(ssh, FORWARD_LOCAL);
+		if ((options.allow_tcp_forwarding & FORWARD_REMOTE) == 0)
+			channel_disable_admin(ssh, FORWARD_REMOTE);
+		else
+			channel_permit_all(ssh, FORWARD_REMOTE);
+	}
 	auth_debug_send();
 
 	prepare_auth_info_file(authctxt->pw, authctxt->session_info);
@@ -302,7 +360,7 @@ xauth_valid_string(const char *s)
 		if (!isalnum((u_char)s[i]) &&
 		    s[i] != '.' && s[i] != ':' && s[i] != '/' &&
 		    s[i] != '-' && s[i] != '_')
-		return 0;
+			return 0;
 	}
 	return 1;
 }
@@ -578,9 +636,9 @@ do_exec(struct ssh *ssh, Session *s, const char *command)
 		original_command = command;
 		command = options.adm_forced_command;
 		forced = "(config)";
-	} else if (forced_command) {
+	} else if (auth_opts->force_command != NULL) {
 		original_command = command;
-		command = forced_command;
+		command = auth_opts->force_command;
 		forced = "(key-option)";
 	}
 	if (forced != NULL) {
@@ -635,7 +693,7 @@ do_exec(struct ssh *ssh, Session *s, const char *command)
 	 * it to the user, otherwise multiple sessions may accumulate
 	 * multiple copies of the login messages.
 	 */
-	buffer_clear(&loginmsg);
+	sshbuf_reset(loginmsg);
 
 	return ret;
 }
@@ -724,24 +782,26 @@ check_quietlogin(Session *s, const char *command)
  * into the environment.  If the file does not exist, this does nothing.
  * Otherwise, it must consist of empty lines, comments (line starts with '#')
  * and assignments of the form name=value.  No other forms are allowed.
+ * If whitelist is not NULL, then it is interpreted as a pattern list and
+ * only variable names that match it will be accepted.
  */
 static void
 read_environment_file(char ***env, u_int *envsize,
-	const char *filename)
+	const char *filename, const char *whitelist)
 {
 	FILE *f;
-	char buf[4096];
-	char *cp, *value;
+	char *line = NULL, *cp, *value;
+	size_t linesize = 0;
 	u_int lineno = 0;
 
 	f = fopen(filename, "r");
 	if (!f)
 		return;
 
-	while (fgets(buf, sizeof(buf), f)) {
+	while (getline(&line, &linesize, f) != -1) {
 		if (++lineno > 1000)
 			fatal("Too many lines in environment file %s", filename);
-		for (cp = buf; *cp == ' ' || *cp == '\t'; cp++)
+		for (cp = line; *cp == ' ' || *cp == '\t'; cp++)
 			;
 		if (!*cp || *cp == '#' || *cp == '\n')
 			continue;
@@ -760,8 +820,12 @@ read_environment_file(char ***env, u_int *envsize,
 		 */
 		*value = '\0';
 		value++;
+		if (whitelist != NULL &&
+		    match_pattern_list(cp, whitelist, 0) != 1)
+			continue;
 		child_set_env(env, envsize, cp, value);
 	}
+	free(line);
 	fclose(f);
 }
 
@@ -769,8 +833,9 @@ static char **
 do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 {
 	char buf[256];
+	size_t n;
 	u_int i, envsize;
-	char **env, *laddr;
+	char *ocp, *cp, *value, **env, *laddr;
 	struct passwd *pw = s->pw;
 
 	/* Initialize the environment. */
@@ -805,21 +870,55 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 
 	if (getenv("TZ"))
 		child_set_env(&env, &envsize, "TZ", getenv("TZ"));
+	if (s->term)
+		child_set_env(&env, &envsize, "TERM", s->term);
+	if (s->display)
+		child_set_env(&env, &envsize, "DISPLAY", s->display);
+#ifdef KRB5
+	if (s->authctxt->krb5_ticket_file)
+		child_set_env(&env, &envsize, "KRB5CCNAME",
+		    s->authctxt->krb5_ticket_file);
+#endif
+	if (auth_sock_name != NULL)
+		child_set_env(&env, &envsize, SSH_AUTHSOCKET_ENV_NAME,
+		    auth_sock_name);
 
-	/* Set custom environment options from RSA authentication. */
-	while (custom_environment) {
-		struct envstring *ce = custom_environment;
-		char *str = ce->s;
 
-		for (i = 0; str[i] != '=' && str[i]; i++)
-			;
-		if (str[i] == '=') {
-			str[i] = 0;
-			child_set_env(&env, &envsize, str, str + i + 1);
+	/* Set custom environment options from pubkey authentication. */
+	if (options.permit_user_env) {
+		for (n = 0 ; n < auth_opts->nenv; n++) {
+			ocp = xstrdup(auth_opts->env[n]);
+			cp = strchr(ocp, '=');
+			if (*cp == '=') {
+				*cp = '\0';
+				/* Apply PermitUserEnvironment whitelist */
+				if (options.permit_user_env_whitelist == NULL ||
+				    match_pattern_list(ocp,
+				    options.permit_user_env_whitelist, 0) == 1)
+					child_set_env(&env, &envsize,
+					    ocp, cp + 1);
+			}
+			free(ocp);
 		}
-		custom_environment = ce->next;
-		free(ce->s);
-		free(ce);
+	}
+
+	/* read $HOME/.ssh/environment. */
+	if (options.permit_user_env) {
+		snprintf(buf, sizeof buf, "%.200s/.ssh/environment",
+		    pw->pw_dir);
+		read_environment_file(&env, &envsize, buf,
+		    options.permit_user_env_whitelist);
+	}
+
+	/* Environment specified by admin */
+	for (i = 0; i < options.num_setenv; i++) {
+		cp = xstrdup(options.setenv[i]);
+		if ((value = strchr(cp, '=')) == NULL) {
+			/* shouldn't happen; vars are checked in servconf.c */
+			fatal("Invalid config SetEnv: %s", options.setenv[i]);
+		}
+		*value++ = '\0';
+		child_set_env(&env, &envsize, cp, value);
 	}
 
 	/* SSH_CLIENT deprecated */
@@ -841,28 +940,10 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 		child_set_env(&env, &envsize, "SSH_USER_AUTH", auth_info_file);
 	if (s->ttyfd != -1)
 		child_set_env(&env, &envsize, "SSH_TTY", s->tty);
-	if (s->term)
-		child_set_env(&env, &envsize, "TERM", s->term);
-	if (s->display)
-		child_set_env(&env, &envsize, "DISPLAY", s->display);
 	if (original_command)
 		child_set_env(&env, &envsize, "SSH_ORIGINAL_COMMAND",
 		    original_command);
-#ifdef KRB5
-	if (s->authctxt->krb5_ticket_file)
-		child_set_env(&env, &envsize, "KRB5CCNAME",
-		    s->authctxt->krb5_ticket_file);
-#endif
-	if (auth_sock_name != NULL)
-		child_set_env(&env, &envsize, SSH_AUTHSOCKET_ENV_NAME,
-		    auth_sock_name);
 
-	/* read $HOME/.ssh/environment. */
-	if (options.permit_user_env) {
-		snprintf(buf, sizeof buf, "%.200s/.ssh/environment",
-		    pw->pw_dir);
-		read_environment_file(&env, &envsize, buf);
-	}
 	if (debug_flag) {
 		/* dump the environment */
 		fprintf(stderr, "Environment:\n");
@@ -877,7 +958,7 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
  * first in this order).
  */
 static void
-do_rc_files(Session *s, const char *shell)
+do_rc_files(struct ssh *ssh, Session *s, const char *shell)
 {
 	FILE *f = NULL;
 	char cmd[1024];
@@ -889,7 +970,7 @@ do_rc_files(Session *s, const char *shell)
 
 	/* ignore _PATH_SSH_USER_RC for subsystems and admin forced commands */
 	if (!s->is_subsystem && options.adm_forced_command == NULL &&
-	    !no_user_rc && options.permit_user_rc &&
+	    auth_opts->permit_user_rc && options.permit_user_rc &&
 	    stat(_PATH_SSH_USER_RC, &st) >= 0) {
 		snprintf(cmd, sizeof cmd, "%s -c '%s %s'",
 		    shell, _PATH_BSHELL, _PATH_SSH_USER_RC);
@@ -1031,7 +1112,7 @@ safely_chroot(const char *path, uid_t uid)
 void
 do_setusercontext(struct passwd *pw)
 {
-	char *chroot_path, *tmp;
+	char uidstr[32], *chroot_path, *tmp;
 
 	if (getuid() == 0 || geteuid() == 0) {
 		/* Prepare groups */
@@ -1045,8 +1126,10 @@ do_setusercontext(struct passwd *pw)
 		    strcasecmp(options.chroot_directory, "none") != 0) {
                         tmp = tilde_expand_filename(options.chroot_directory,
 			    pw->pw_uid);
+			snprintf(uidstr, sizeof(uidstr), "%llu",
+			    (unsigned long long)pw->pw_uid);
 			chroot_path = percent_expand(tmp, "h", pw->pw_dir,
-			    "u", pw->pw_name, (char *)NULL);
+			    "u", pw->pw_name, "U", uidstr, (char *)NULL);
 			safely_chroot(chroot_path, pw->pw_uid);
 			free(tmp);
 			free(chroot_path);
@@ -1230,7 +1313,7 @@ do_child(struct ssh *ssh, Session *s, const char *command)
 
 	closefrom(STDERR_FILENO + 1);
 
-	do_rc_files(s, shell);
+	do_rc_files(ssh, s, shell);
 
 	/* restore SIGPIPE for child */
 	signal(SIGPIPE, SIG_DFL);
@@ -1488,10 +1571,9 @@ static int
 session_pty_req(struct ssh *ssh, Session *s)
 {
 	u_int len;
-	int n_bytes;
 
-	if (no_pty_flag || !options.permit_tty) {
-		debug("Allocating a pty not permitted for this authentication.");
+	if (!auth_opts->permit_pty_flag || !options.permit_tty) {
+		debug("Allocating a pty not permitted for this connection.");
 		return 0;
 	}
 	if (s->ttyfd != -1) {
@@ -1523,8 +1605,7 @@ session_pty_req(struct ssh *ssh, Session *s)
 	}
 	debug("session_pty_req: session %d alloc %s", s->self, s->tty);
 
-	n_bytes = packet_remaining();
-	tty_parse_modes(s->ttyfd, &n_bytes);
+	ssh_tty_parse_modes(ssh, s->ttyfd);
 
 	if (!use_privsep)
 		pty_setowner(s->pw, s->tty);
@@ -1679,9 +1760,11 @@ static int
 session_auth_agent_req(struct ssh *ssh, Session *s)
 {
 	static int called = 0;
+
 	packet_check_eom();
-	if (no_agent_forwarding_flag || !options.allow_agent_forwarding) {
-		debug("session_auth_agent_req: no_agent_forwarding_flag");
+	if (!auth_opts->permit_agent_forwarding_flag ||
+	    !options.allow_agent_forwarding) {
+		debug("%s: agent forwarding disabled", __func__);
 		return 0;
 	}
 	if (called) {
@@ -2046,8 +2129,8 @@ session_setup_x11fwd(struct ssh *ssh, Session *s)
 	char hostname[NI_MAXHOST];
 	u_int i;
 
-	if (no_x11_forwarding_flag) {
-		packet_send_debug("X11 forwarding disabled in user configuration file.");
+	if (!auth_opts->permit_x11_forwarding_flag) {
+		packet_send_debug("X11 forwarding disabled by key options.");
 		return 0;
 	}
 	if (!options.x11_forwarding) {
@@ -2056,7 +2139,7 @@ session_setup_x11fwd(struct ssh *ssh, Session *s)
 	}
 	if (options.xauth_location == NULL ||
 	    (stat(options.xauth_location, &st) == -1)) {
-		packet_send_debug("No xauth program; cannot forward with spoofing.");
+		packet_send_debug("No xauth program; cannot forward X11.");
 		return 0;
 	}
 	if (s->display != NULL) {

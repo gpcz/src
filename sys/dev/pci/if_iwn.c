@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_iwn.c,v 1.197 2017/12/20 18:20:59 stsp Exp $	*/
+/*	$OpenBSD: if_iwn.c,v 1.203 2018/04/28 16:05:56 phessler Exp $	*/
 
 /*-
  * Copyright (c) 2007-2010 Damien Bergamini <damien.bergamini@free.fr>
@@ -1772,6 +1772,28 @@ iwn_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 			iwn_scan_abort(sc);
 	}
 
+	if (ic->ic_state == IEEE80211_S_SCAN) {
+		if (nstate == IEEE80211_S_SCAN) {
+			if (sc->sc_flags & IWN_FLAG_SCANNING)
+				return 0;
+		} else
+			sc->sc_flags &= ~IWN_FLAG_SCANNING;
+		/* Turn LED off when leaving scan state. */
+		iwn_set_led(sc, IWN_LED_LINK, 1, 0);
+	}
+
+	if (ic->ic_state >= IEEE80211_S_ASSOC &&
+	    nstate <= IEEE80211_S_ASSOC) {
+		/* Reset state to handle re- and disassociations. */
+		sc->rxon.associd = 0;
+		sc->rxon.filter &= ~htole32(IWN_FILTER_BSS);
+		sc->calib.state = IWN_CALIB_STATE_INIT;
+		error = iwn_cmd(sc, IWN_CMD_RXON, &sc->rxon, sc->rxonsz, 1);
+		if (error != 0)
+			printf("%s: RXON command failed\n",
+			    sc->sc_dev.dv_xname);
+	}		 
+
 	switch (nstate) {
 	case IEEE80211_S_SCAN:
 		/* Make the link LED blink while we're scanning. */
@@ -1782,6 +1804,14 @@ iwn_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 			    sc->sc_dev.dv_xname);
 			return error;
 		}
+		if (ifp->if_flags & IFF_DEBUG)
+			printf("%s: %s -> %s\n", ifp->if_xname,
+			    ieee80211_state_name[ic->ic_state],
+			    ieee80211_state_name[nstate]);
+		if ((sc->sc_flags & IWN_FLAG_BGSCAN) == 0) {
+			ieee80211_set_link_state(ic, LINK_STATE_DOWN);
+			ieee80211_free_allnodes(ic, 1);
+		}
 		ic->ic_state = nstate;
 		return 0;
 
@@ -1790,11 +1820,6 @@ iwn_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 			break;
 		/* FALLTHROUGH */
 	case IEEE80211_S_AUTH:
-		/* Reset state to handle reassociations correctly. */
-		sc->rxon.associd = 0;
-		sc->rxon.filter &= ~htole32(IWN_FILTER_BSS);
-		sc->calib.state = IWN_CALIB_STATE_INIT;
-
 		if ((error = iwn_auth(sc, arg)) != 0) {
 			printf("%s: could not move to auth state\n",
 			    sc->sc_dev.dv_xname);
@@ -1982,7 +2007,7 @@ iwn_rx_done(struct iwn_softc *sc, struct iwn_rx_desc *desc,
 	caddr_t head;
 	uint32_t flags;
 	int error, len, rssi;
-	uint8_t chan;
+	uint16_t chan;
 
 	if (desc->type == IWN_MPDU_RX_DONE) {
 		/* Check for prior RX_PHY notification. */
@@ -2635,8 +2660,9 @@ iwn_notif_intr(struct iwn_softc *sc)
 				if (error == 0)
 					break;
 			}
-			ieee80211_end_scan(ifp);
+			sc->sc_flags &= ~IWN_FLAG_SCANNING;
 			sc->sc_flags &= ~IWN_FLAG_BGSCAN;
+			ieee80211_end_scan(ifp);
 			break;
 		}
 		case IWN5000_CALIBRATION_RESULT:
@@ -4904,11 +4930,12 @@ iwn_scan(struct iwn_softc *sc, uint16_t flags, int bgscan)
 	hdr->len = htole16(buflen);
 
 	DPRINTF(("sending scan command nchan=%d\n", hdr->nchan));
-	if (bgscan)
-		sc->sc_flags |= IWN_FLAG_BGSCAN;
 	error = iwn_cmd(sc, IWN_CMD_SCAN, buf, buflen, 1);
-	if (bgscan && error)
-		sc->sc_flags &= ~IWN_FLAG_BGSCAN;
+	if (error == 0) {
+		sc->sc_flags |= IWN_FLAG_SCANNING;
+		if (bgscan)
+			sc->sc_flags |= IWN_FLAG_BGSCAN;
+	}
 	free(buf, M_DEVBUF, IWN_SCAN_MAXSZ);
 	return error;
 }
@@ -4921,6 +4948,7 @@ iwn_scan_abort(struct iwn_softc *sc)
 	/* XXX Cannot wait for status response in interrupt context. */
 	DELAY(100);
 
+	sc->sc_flags &= ~IWN_FLAG_SCANNING;
 	sc->sc_flags &= ~IWN_FLAG_BGSCAN;
 }
 
@@ -4929,6 +4957,9 @@ iwn_bgscan(struct ieee80211com *ic)
 {
 	struct iwn_softc *sc = ic->ic_softc;
 	int error; 
+
+	if (sc->sc_flags & IWN_FLAG_SCANNING)
+		return 0;
 
 	error = iwn_scan(sc, IEEE80211_CHAN_2GHZ, 1);
 	if (error)
@@ -6605,11 +6636,6 @@ iwn_stop(struct ifnet *ifp, int disable)
 	ifp->if_timer = sc->sc_tx_timer = 0;
 	ifp->if_flags &= ~IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
-
-	/* In case we were scanning, release the scan "lock". */
-	if (ic->ic_scan_lock & IEEE80211_SCAN_REQUEST)
-		wakeup(&ic->ic_scan_lock);
-	ic->ic_scan_lock = IEEE80211_SCAN_UNLOCKED;
 
 	ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
 
