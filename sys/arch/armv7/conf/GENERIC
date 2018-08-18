@@ -66,6 +66,7 @@ wsdisplay*	at ssdfb?
 
 # Atmel
 atmlaic*	at fdt?			# interrupt controller
+atmluart*	at fdt?			# UART
 
 # OMAP3xxx/OMAP4xxx SoC
 omap0		at mainbus?

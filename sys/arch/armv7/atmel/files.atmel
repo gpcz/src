@@ -2,3 +2,7 @@
 device atmlaic
 attach atmlaic at fdt
 file   arch/armv7/atmel/atmlaic.c		atmlaic
+
+device atmluart
+attach atmluart at fdt
+file   arch/armv7/atmel/atmluart.c		atmluart
