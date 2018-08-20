@@ -41,6 +41,9 @@ struct cfattach atmluart_ca = {
 	sizeof(struct atmluart_softc), atmluartprobe, atmluartattach
 };
 
+void atmluart_init_cons(void) {
+}
+
 int atmluartprobe(struct device *parent, void *self, void *aux) {
 	struct fdt_attach_args *faa = aux;
 

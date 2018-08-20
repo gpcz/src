@@ -35,6 +35,7 @@ void	exuart_init_cons(void);
 void	imxuart_init_cons(void);
 void	com_fdt_init_cons(void);
 void	pluart_init_cons(void);
+void	atmluart_init_cons(void);
 
 struct armv7_platform *omap_platform_match(void);
 
@@ -91,6 +92,7 @@ platform_init_cons(void)
 	imxuart_init_cons();
 	com_fdt_init_cons();
 	pluart_init_cons();
+	atmluart_init_cons();
 }
 
 void
