@@ -25,6 +25,12 @@
 
 #include <dev/ofw/openfirm.h>
 
+#define AUART_STATUS	0x0014
+#define  AUART_RXRDY	0x0001
+#define  AUART_TXRDY	0x0002
+#define AUART_RXHLD	0x0018
+#define AUART_TXHLD	0x001C
+
 struct atmluart_softc {
 };
 
