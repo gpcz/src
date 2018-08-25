@@ -101,6 +101,8 @@ int atmluartcngetc(dev_t dev) {
 	int character;
 	int s;
 	s = splhigh();
+	while(bus_space_read_4(atmluartconsiot, atmluartconsioh, AUART_STATUS) & AUART_RXRDY == 0);
+	c = bus_space_read_4(atmlaurtconsiot, atmluartconsioh, AUART_RXHLD) & 0xFF;
 	splx(s);
 	return character;
 }
@@ -108,6 +110,8 @@ int atmluartcngetc(dev_t dev) {
 void atmluartcnputc(dev_t dev, int c) {
 	int s;
 	s = splhigh();
+	while(bus_space_read_4(atmluartconsiot, atmluartconsioh, AUART_STATUS) & AUART_TXRDY == 0);
+	bus_space_write_4(atmluartconsiot, atmluartconsioh, AUART_TXHLD, c);
 	splx(s);
 }
 
