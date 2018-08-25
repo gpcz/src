@@ -34,8 +34,13 @@
 struct atmluart_softc {
 };
 
-int     atmluartprobe(struct device *parent, void *self, void *aux);           
-void atmluartattach(struct device *parent, struct device *self, void *aux);
+int	atmluartprobe(struct device *parent, void *self, void *aux);           
+void	atmluartattach(struct device *parent, struct device *self, void *aux);
+int	atmluartcnattach(bus_space_tag_t iot, bus_addr_t iobase, int rate,
+    tcflag_t cflag);
+int	atmluartcngetc(dev_t dev);
+void	atmluartcnputc(dev_t dev, int c);
+void	atmluartcnpollc(dev_t dev, int on);
 
 cdev_decl(atmluart);
 
@@ -47,7 +52,22 @@ struct cfattach atmluart_ca = {
 	sizeof(struct atmluart_softc), atmluartprobe, atmluartattach
 };
 
+bus_space_tag_t		atmluartconsiot;
+bus_space_handle_t	atmluartconsioh;
+bus_addr_t		atmluartconsaddr;
+tcflag_t		atmluartconscflag = TTYDEF_CFLAG;
+
 void atmluart_init_cons(void) {
+	struct fdt_reg reg;
+	void *node;
+
+	if ((node = fdt_find_cons("atmel,at91sam9260-dbgu")) == NULL)
+		return;
+
+	if (fdt_get_reg(node, 0, &reg))
+		return;
+
+	atmluartcnattach(fdt_cons_bs_tag, reg.addr, B115200, TTYDEF_CFLAG);
 }
 
 int atmluartprobe(struct device *parent, void *self, void *aux) {
@@ -56,5 +76,43 @@ int atmluartprobe(struct device *parent, void *self, void *aux) {
 	return OF_is_compatible(faa->fa_node, "atmel,at91sam9260-usart");
 }
 
-void atmluartattach(struct device *parent, struct device *self, void *aux) {
+int atmluartcnattach(bus_space_tag_t iot, bus_addr_t iobase, int rate, tcflag_t cflag) {
+	static struct consdev atmluartcons = {
+		NULL, NULL, atmluartcngetc, atmluartcnputc, atmluartcnpollc, NULL,
+		NODEV, CN_MIDPRI
+	};
+
+	if (bus_space_map(iot, iobase, 0x100, 0, &atmluartconsioh))
+			return ENOMEM;
+
+	cn_tab = &atmluartcons;
+	cn_tab->cn_dev = makedev(12, 0);
+
+	atmluartconsiot = iot;
+	atmluartconsaddr = iobase;
+	atmluartconscflag = cflag;
+
+	return 0;
 }
+
+int atmluartcngetc(dev_t dev) {
+	int character;
+	int s;
+	s = splhigh();
+	splx(s);
+	return character;
+}
+
+void atmluartcnputc(dev_t dev, int c) {
+	int s;
+	s = splhigh();
+	splx(s);
+}
+
+void atmluartcnpollc(dev_t dev, int on) {
+}
+
+/*void atmluartattach(struct device *parent, struct device *self, void *aux) {
+  }*/
+
+
