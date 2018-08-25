@@ -24,6 +24,7 @@
 
 #include <machine/fdt.h>
 
+#include <dev/ofw/fdt.h>
 #include <dev/ofw/openfirm.h>
 
 #define AUART_STATUS	0x0014
