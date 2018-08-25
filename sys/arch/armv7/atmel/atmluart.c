@@ -102,7 +102,7 @@ int atmluartcngetc(dev_t dev) {
 	int s;
 	s = splhigh();
 	while((bus_space_read_4(atmluartconsiot, atmluartconsioh, AUART_STATUS) & AUART_RXRDY) == 0);
-	c = bus_space_read_4(atmluartconsiot, atmluartconsioh, AUART_RXHLD) & 0xFF;
+	character = bus_space_read_4(atmluartconsiot, atmluartconsioh, AUART_RXHLD) & 0xFF;
 	splx(s);
 	return character;
 }
