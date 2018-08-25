@@ -114,7 +114,7 @@ void atmluartcnputc(dev_t dev, int c) {
 void atmluartcnpollc(dev_t dev, int on) {
 }
 
-/*void atmluartattach(struct device *parent, struct device *self, void *aux) {
-  }*/
+void atmluartattach(struct device *parent, struct device *self, void *aux) {
+}
 
 
