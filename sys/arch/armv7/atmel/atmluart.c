@@ -18,6 +18,7 @@
 #include <sys/uio.h>
 #include <sys/device.h>
 #include <sys/conf.h>
+#include <sys/tty.h>
 
 #include <dev/cons.h>
 
