@@ -1,4 +1,4 @@
-/*	$OpenBSD: editor.c,v 1.343 2018/08/04 16:09:00 krw Exp $	*/
+/*	$OpenBSD: editor.c,v 1.346 2018/08/28 12:40:54 krw Exp $	*/
 
 /*
  * Copyright (c) 1997-2000 Todd C. Miller <Todd.Miller@courtesan.com>
@@ -53,6 +53,7 @@
 #define	ROUND_OFFSET_DOWN	0x00000002
 #define	ROUND_SIZE_UP		0x00000004
 #define	ROUND_SIZE_DOWN		0x00000008
+#define	ROUND_SIZE_OVERLAP	0x00000010
 
 /* Special return values for getnumber and getuint64() */
 #define	CMD_ABORTED	(ULLONG_MAX - 1)
@@ -684,9 +685,13 @@ again:
 			pp->p_fstype = FS_SWAP;
 		else {
 			pp->p_fstype = FS_BSDFFS;
-			get_fsize(lp, partno);
-			get_bsize(lp, partno);
-			get_cpg(lp, partno);
+			pp->p_fragblock = 0;
+			if (get_fsize(lp, partno) == 1 ||
+			    get_bsize(lp, partno) == 1 ||
+			    get_cpg(lp, partno) == 1) {
+				free(alloc);
+				return 1;
+			}
 			free(*partmp);
 			if ((*partmp = strdup(ap->mp)) == NULL)
 				errx(4, "out of memory");
@@ -707,7 +712,7 @@ editor_resize(struct disklabel *lp, char *p)
 	struct disklabel label;
 	struct partition *pp, *prev;
 	u_int64_t ui, sz, off;
-	int partno, i, flags;
+	int partno, i, flags, shrunk;
 
 	label = *lp;
 
@@ -761,14 +766,17 @@ editor_resize(struct disklabel *lp, char *p)
 	}
 
 	DL_SETPSIZE(pp, ui);
-	get_fsize(&label, partno);
-	get_bsize(&label, partno);
-	get_cpg(&label, partno);
+	pp->p_fragblock = 0;
+	if (get_fsize(&label, partno) == 1 ||
+	    get_bsize(&label, partno) == 1 ||
+	    get_cpg(&label, partno) == 1)
+		return;
 
 	/*
 	 * Pack partitions above the resized partition, leaving unused
 	 * partitions alone.
 	 */
+	shrunk = -1;
 	prev = pp;
 	for (i = partno + 1; i < MAXPARTITIONS; i++) {
 		if (i == RAW_PART)
@@ -786,19 +794,24 @@ editor_resize(struct disklabel *lp, char *p)
 			DL_SETPOFFSET(pp, off);
 			if (off + DL_GETPSIZE(pp) > ending_sector) {
 				DL_SETPSIZE(pp, ending_sector - off);
-				fprintf(stderr,
-				    "Partition %c shrunk to make room\n",
-				    i + 'a');
-				get_fsize(&label, i);
-				get_bsize(&label, i);
-				get_cpg(&label, i);
+				pp->p_fragblock = 0;
+				if (get_fsize(&label, partno) == 1 ||
+				    get_bsize(&label, partno) == 1 ||
+				    get_cpg(&label, partno) == 1)
+					return;
+				shrunk = i;
 			}
 		} else {
-			fputs("No room left for all partitions\n", stderr);
+			fputs("Amount too big\n", stderr);
 			return;
 		}
 		prev = pp;
 	}
+
+	if (shrunk != -1)
+		fprintf(stderr, "Partition %c shrunk to %llu sectors to make "
+		    "room\n", 'a' + shrunk,
+		    DL_GETPSIZE(&label.d_partitions[shrunk]));
 	*lp = label;
 }
 
@@ -2046,8 +2059,8 @@ align:
 	if (DL_GETPOFFSET(pp) != starting_sector)
 		offsetalign = sizealign;
 
-	if (alignpartition(lp, partno, offsetalign, sizealign, ROUND_SIZE_DOWN)
-	    == 1) {
+	if (alignpartition(lp, partno, offsetalign, sizealign, ROUND_OFFSET_UP |
+	    ROUND_SIZE_DOWN | ROUND_SIZE_OVERLAP) == 1) {
 		*pp = opp;
 		return (1);
 	}
@@ -2506,7 +2519,7 @@ alignpartition(struct disklabel *lp, int partno, u_int64_t startalign,
 	else if ((flags & ROUND_SIZE_DOWN) == ROUND_SIZE_DOWN)
 		stop = (stop / stopalign) * stopalign;
 
-	if (stop  > maxstop)
+	if (((flags & ROUND_SIZE_OVERLAP) == 0) && stop  > maxstop)
 		stop = maxstop;
 
 	if (start != DL_GETPOFFSET(pp))

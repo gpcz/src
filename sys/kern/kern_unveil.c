@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_unveil.c,v 1.12 2018/08/07 15:07:54 deraadt Exp $	*/
+/*	$OpenBSD: kern_unveil.c,v 1.14 2018/08/28 02:51:55 beck Exp $	*/
 
 /*
  * Copyright (c) 2017-2018 Bob Beck <beck@openbsd.org>
@@ -369,7 +369,14 @@ unveil_add_vnode(struct process *pr, struct vnode *vp)
 	rw_init(&uv->uv_lock, "unveil");
 	RBT_INIT(unvname_rbt, &uv->uv_names);
 	uv->uv_vp = vp;
-	uv->uv_flags = 0;
+	/*
+	 * Added vnodes are added with the UNVEIL_INSPECT flag
+	 * to allow operations such as access and stat. This lets
+	 * TOCTOU fans that call access on all components of
+	 * an unveil'ed path before the final operations
+	 * work.
+	 */
+	uv->uv_flags = UNVEIL_INSPECT;
 	pr->ps_uvvcount++;
 	return (uv);
 }
@@ -377,10 +384,8 @@ unveil_add_vnode(struct process *pr, struct vnode *vp)
 void
 unveil_add_traversed_vnodes(struct proc *p, struct nameidata *ndp)
 {
-	/*
-	 * add the traversed vnodes with 0 flags if they
-	 * are not already present.
-	 */
+	struct unveil *uv;
+
 	if (ndp->ni_tvpsize) {
 		size_t i;
 
@@ -389,7 +394,7 @@ unveil_add_traversed_vnodes(struct proc *p, struct nameidata *ndp)
 			if (unveil_lookup(vp, p) == NULL) {
 				vref(vp);
 				vp->v_uvcount++;
-				unveil_add_vnode(p->p_p, vp);
+				uv = unveil_add_vnode(p->p_p, vp);
 			}
 		}
 	}
@@ -533,25 +538,10 @@ int
 unveil_flagmatch(struct nameidata *ni, u_char flags)
 {
 	if (flags == 0) {
-		/* XXX Fix this, you can do it better */
-		if (ni->ni_pledge & PLEDGE_STAT) {
-#ifdef DEBUG_UNVEIL
-			printf("allowing stat/accesss for 0 flags");
-#endif
-			SET(ni->ni_pledge, PLEDGE_STATLIE);
-			return 1;
-		}
 #ifdef DEBUG_UNVEIL
 		printf("All operations forbidden for 0 flags\n");
 #endif
 		return 0;
-	}
-	if (ni->ni_pledge & PLEDGE_STAT) {
-#ifdef DEBUG_UNVEIL
-		printf("Allowing stat for nonzero flags\n");
-#endif
-		CLR(ni->ni_pledge, PLEDGE_STATLIE);
-		return 1;
 	}
 	if (ni->ni_unveil & UNVEIL_READ) {
 		if ((flags & UNVEIL_READ) == 0) {
@@ -585,6 +575,11 @@ unveil_flagmatch(struct nameidata *ni, u_char flags)
 			return 0;
 		}
 	}
+	if (ni->ni_unveil & UNVEIL_INSPECT) {
+#ifdef DEBUG_UNVEIL
+		printf("any unveil allows UNVEIL_INSPECT\n");
+#endif
+	}
 	return 1;
 }
 
@@ -602,7 +597,7 @@ unveil_check_component(struct proc *p, struct nameidata *ni, struct vnode *dp)
 		    (uv = unveil_lookup(dp, p)) != NULL) {
 			/* if directory flags match, it's a match */
 			if (unveil_flagmatch(ni, uv->uv_flags)) {
-				if (uv->uv_flags) {
+				if (uv->uv_flags & UNVEIL_USERSET) {
 					ni->ni_unveil_match = uv;
 #ifdef DEBUG_UNVEIL
 					printf("unveil: %s(%d): component directory match"
