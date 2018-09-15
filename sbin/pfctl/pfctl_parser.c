@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl_parser.c,v 1.327 2018/08/10 09:54:06 kn Exp $ */
+/*	$OpenBSD: pfctl_parser.c,v 1.337 2018/09/13 06:03:27 kn Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -62,6 +62,7 @@
 #include "pfctl_parser.h"
 #include "pfctl.h"
 
+void		 copy_satopfaddr(struct pf_addr *, struct sockaddr *);
 void		 print_op (u_int8_t, const char *, const char *);
 void		 print_port (u_int8_t, u_int16_t, u_int16_t, const char *, int);
 void		 print_ugid (u_int8_t, unsigned, unsigned, const char *, unsigned);
@@ -74,8 +75,7 @@ int		 ifa_skip_if(const char *filter, struct node_host *p);
 
 struct node_host	*ifa_grouplookup(const char *, int);
 struct node_host	*host_if(const char *, int);
-struct node_host	*host_v4(const char *, int);
-struct node_host	*host_v6(const char *, int);
+struct node_host	*host_ip(const char *, int);
 struct node_host	*host_dns(const char *, int, int);
 
 const char *tcpflags = "FSRPAUEW";
@@ -210,6 +210,15 @@ const struct pf_timeout pf_timeouts[] = {
 };
 
 enum { PF_POOL_ROUTE, PF_POOL_NAT, PF_POOL_RDR };
+
+void
+copy_satopfaddr(struct pf_addr *pfa, struct sockaddr *sa)
+{
+	if (sa->sa_family == AF_INET6)
+		pfa->v6 = ((struct sockaddr_in6 *)sa)->sin6_addr;
+	else
+		pfa->v4 = ((struct sockaddr_in *)sa)->sin_addr;
+}
 
 const struct icmptypeent *
 geticmptypebynumber(u_int8_t type, sa_family_t af)
@@ -1257,13 +1266,19 @@ parse_flags(char *s)
 }
 
 void
-set_ipmask(struct node_host *h, u_int8_t b)
+set_ipmask(struct node_host *h, int bb)
 {
 	struct pf_addr	*m, *n;
 	int		 i, j = 0;
+	u_int8_t	 b;
 
 	m = &h->addr.v.a.mask;
 	memset(m, 0, sizeof(*m));
+
+	if (bb == -1)
+		b = h->af == AF_INET ? 32 : 128;
+	else
+		b = bb;
 
 	while (b >= 32) {
 		m->addr32[j++] = 0xffffffff;
@@ -1295,7 +1310,7 @@ check_netmask(struct node_host *h, sa_family_t af)
 		if (af == AF_INET &&
 		    (m->addr32[1] || m->addr32[2] || m->addr32[3])) {
 			fprintf(stderr, "netmask %u invalid for IPv4 address\n",
-			    unmask(m, AF_INET6));
+			    unmask(m));
 			return (1);
 		}
 	}
@@ -1306,7 +1321,6 @@ struct node_host *
 gen_dynnode(struct node_host *h, sa_family_t af)
 {
 	struct node_host	*n;
-	struct pf_addr		*m;
 
 	if (h->addr.type != PF_ADDR_DYNIFTL)
 		return (NULL);
@@ -1319,8 +1333,7 @@ gen_dynnode(struct node_host *h, sa_family_t af)
 	n->tail = NULL;
 
 	/* fix up netmask */
-	m = &n->addr.v.a.mask;
-	if (af == AF_INET && unmask(m, AF_INET6) > 32)
+	if (af == AF_INET && unmask(&n->addr.v.a.mask) > 32)
 		set_ipmask(n, 32);
 
 	return (n);
@@ -1346,7 +1359,7 @@ ifa_load(void)
 				continue;
 		n = calloc(1, sizeof(struct node_host));
 		if (n == NULL)
-			err(1, "address: calloc");
+			err(1, "%s: calloc", __func__);
 		n->af = ifa->ifa_addr->sa_family;
 		n->ifa_flags = ifa->ifa_flags;
 #ifdef __KAME__
@@ -1365,44 +1378,22 @@ ifa_load(void)
 		}
 #endif
 		n->ifindex = 0;
-		if (n->af == AF_INET) {
-			memcpy(&n->addr.v.a.addr, &((struct sockaddr_in *)
-			    ifa->ifa_addr)->sin_addr.s_addr,
-			    sizeof(struct in_addr));
-			memcpy(&n->addr.v.a.mask, &((struct sockaddr_in *)
-			    ifa->ifa_netmask)->sin_addr.s_addr,
-			    sizeof(struct in_addr));
-			if (ifa->ifa_broadaddr != NULL)
-				memcpy(&n->bcast, &((struct sockaddr_in *)
-				    ifa->ifa_broadaddr)->sin_addr.s_addr,
-				    sizeof(struct in_addr));
-			if (ifa->ifa_dstaddr != NULL)
-				memcpy(&n->peer, &((struct sockaddr_in *)
-				    ifa->ifa_dstaddr)->sin_addr.s_addr,
-				    sizeof(struct in_addr));
-		} else if (n->af == AF_INET6) {
-			memcpy(&n->addr.v.a.addr, &((struct sockaddr_in6 *)
-			    ifa->ifa_addr)->sin6_addr.s6_addr,
-			    sizeof(struct in6_addr));
-			memcpy(&n->addr.v.a.mask, &((struct sockaddr_in6 *)
-			    ifa->ifa_netmask)->sin6_addr.s6_addr,
-			    sizeof(struct in6_addr));
-			if (ifa->ifa_broadaddr != NULL)
-				memcpy(&n->bcast, &((struct sockaddr_in6 *)
-				    ifa->ifa_broadaddr)->sin6_addr.s6_addr,
-				    sizeof(struct in6_addr));
-			if (ifa->ifa_dstaddr != NULL)
-				 memcpy(&n->peer, &((struct sockaddr_in6 *)
-				    ifa->ifa_dstaddr)->sin6_addr.s6_addr,
-				    sizeof(struct in6_addr));
-			n->ifindex = ((struct sockaddr_in6 *)
-			    ifa->ifa_addr)->sin6_scope_id;
-		} else if (n->af == AF_LINK) {
+		if (n->af == AF_LINK)
 			n->ifindex = ((struct sockaddr_dl *)
 			    ifa->ifa_addr)->sdl_index;
+		else {
+			copy_satopfaddr(&n->addr.v.a.addr, ifa->ifa_addr);
+			copy_satopfaddr(&n->addr.v.a.mask, ifa->ifa_netmask);
+			if (ifa->ifa_broadaddr != NULL)
+				copy_satopfaddr(&n->bcast, ifa->ifa_broadaddr);
+			if (ifa->ifa_dstaddr != NULL)
+				copy_satopfaddr(&n->peer, ifa->ifa_dstaddr);
+			if (n->af == AF_INET6)
+				n->ifindex = ((struct sockaddr_in6 *)
+				    ifa->ifa_addr)->sin6_scope_id;
 		}
 		if ((n->ifname = strdup(ifa->ifa_name)) == NULL)
-			err(1, "ifa_load: strdup");
+			err(1, "%s: strdup", __func__);
 		n->next = NULL;
 		n->tail = n;
 		if (h == NULL)
@@ -1564,7 +1555,7 @@ ifa_lookup(const char *ifa_name, int flags)
 			got6 = 1;
 		n = calloc(1, sizeof(struct node_host));
 		if (n == NULL)
-			err(1, "address: calloc");
+			err(1, "%s: calloc", __func__);
 		n->af = p->af;
 		if (flags & PFI_AFLAG_BROADCAST)
 			memcpy(&n->addr.v.a.addr, &p->bcast,
@@ -1576,19 +1567,9 @@ ifa_lookup(const char *ifa_name, int flags)
 			memcpy(&n->addr.v.a.addr, &p->addr.v.a.addr,
 			    sizeof(struct pf_addr));
 		if (flags & PFI_AFLAG_NETWORK)
-			set_ipmask(n, unmask(&p->addr.v.a.mask, n->af));
-		else {
-			if (n->af == AF_INET) {
-				if (p->ifa_flags & IFF_LOOPBACK &&
-				    p->ifa_flags & IFF_LINK1)
-					memcpy(&n->addr.v.a.mask,
-					    &p->addr.v.a.mask,
-					    sizeof(struct pf_addr));
-				else
-					set_ipmask(n, 32);
-			} else
-				set_ipmask(n, 128);
-		}
+			set_ipmask(n, unmask(&p->addr.v.a.mask));
+		else
+			set_ipmask(n, -1);
 		n->ifindex = p->ifindex;
 
 		n->next = NULL;
@@ -1629,11 +1610,11 @@ host(const char *s, int opts)
 {
 	struct node_host	*h = NULL, *n;
 	int			 mask = -1;
-	char			*p, *r, *ps, *if_name;
+	char			*p, *ps, *if_name;
 	const char		*errstr;
 
 	if ((ps = strdup(s)) == NULL)
-		err(1, "host: strdup");
+		err(1, "%s: strdup", __func__);
 
 	if ((if_name = strrchr(ps, '@')) != NULL) {
 		if_name[0] = '\0';
@@ -1641,20 +1622,16 @@ host(const char *s, int opts)
 	}
 
 	if ((p = strrchr(ps, '/')) != NULL) {
-		if ((r = strdup(ps)) == NULL)
-			err(1, "host: strdup");
 		mask = strtonum(p+1, 0, 128, &errstr);
 		if (errstr) {
 			fprintf(stderr, "netmask is %s: %s\n", errstr, p);
 			goto error;
 		}
 		p[0] = '\0';
-	} else
-		r = ps;
+	}
 
 	if ((h = host_if(ps, mask)) == NULL &&
-	    (h = host_v4(r, mask)) == NULL &&
-	    (h = host_v6(ps, mask)) == NULL &&
+	    (h = host_ip(ps, mask)) == NULL &&
 	    (h = host_dns(ps, mask, (opts & PF_OPT_NODNS))) == NULL) {
 		fprintf(stderr, "no IP address found for %s\n", s);
 		goto error;
@@ -1663,15 +1640,13 @@ host(const char *s, int opts)
 	if (if_name && if_name[0])
 		for (n = h; n != NULL; n = n->next)
 			if ((n->ifname = strdup(if_name)) == NULL)
-				err(1, "host: strdup");
+				err(1, "%s: strdup", __func__);
 	for (n = h; n != NULL; n = n->next) {
 		n->addr.type = PF_ADDR_ADDRMASK;
 		n->weight = 0;
 	}	
 
 error:
-	if (r != ps)
-		free(r);
 	free(ps);
 	return (h);
 }
@@ -1694,88 +1669,69 @@ host_if(const char *s, int mask)
 			flags |= PFI_AFLAG_PEER;
 		else if (!strcmp(p+1, "0"))
 			flags |= PFI_AFLAG_NOALIAS;
-		else {
-			free(ps);
-			return (NULL);
-		}
+		else
+			goto error;
 		*p = '\0';
 	}
 	if (flags & (flags - 1) & PFI_AFLAG_MODEMASK) { /* Yep! */
 		fprintf(stderr, "illegal combination of interface modifiers\n");
-		free(ps);
-		return (NULL);
+		goto error;
 	}
 	if ((flags & (PFI_AFLAG_NETWORK|PFI_AFLAG_BROADCAST)) && mask > -1) {
 		fprintf(stderr, "network or broadcast lookup, but "
 		    "extra netmask given\n");
-		free(ps);
-		return (NULL);
+		goto error;
 	}
 	if (ifa_exists(ps) || !strncmp(ps, "self", IFNAMSIZ)) {
 		/* interface with this name exists */
 		h = ifa_lookup(ps, flags);
-		for (n = h; n != NULL && mask > -1; n = n->next)
-			set_ipmask(n, mask);
+		if (mask > -1)
+			for (n = h; n != NULL; n = n->next)
+				set_ipmask(n, mask);
 	}
 
+error:
 	free(ps);
 	return (h);
 }
 
 struct node_host *
-host_v4(const char *s, int mask)
-{
-	struct node_host	*h = NULL;
-	struct in_addr		 ina;
-
-	memset(&ina, 0, sizeof(ina));
-	if (mask > -1) {
-		if (inet_net_pton(AF_INET, s, &ina, sizeof(ina)) == -1)
-			return (NULL);
-	} else {
-		if (inet_pton(AF_INET, s, &ina) != 1)
-			return (NULL);
-	}
-
-	h = calloc(1, sizeof(struct node_host));
-	if (h == NULL)
-		err(1, "address: calloc");
-	h->ifname = NULL;
-	h->af = AF_INET;
-	h->addr.v.a.addr.addr32[0] = ina.s_addr;
-	set_ipmask(h, mask > -1 ? mask : 32);
-	h->next = NULL;
-	h->tail = h;
-
-	return (h);
-}
-
-struct node_host *
-host_v6(const char *s, int mask)
+host_ip(const char *s, int mask)
 {
 	struct addrinfo		 hints, *res;
 	struct node_host	*h = NULL;
 
 	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET6;
+	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM; /*dummy*/
 	hints.ai_flags = AI_NUMERICHOST;
-	if (getaddrinfo(s, "0", &hints, &res) == 0) {
-		h = calloc(1, sizeof(struct node_host));
+	if (getaddrinfo(s, NULL, &hints, &res) == 0) {
+		h = calloc(1, sizeof(*h));
 		if (h == NULL)
-			err(1, "address: calloc");
-		h->ifname = NULL;
-		h->af = AF_INET6;
-		memcpy(&h->addr.v.a.addr,
-		    &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
-		    sizeof(h->addr.v.a.addr));
-		h->ifindex =
-		    ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
-		set_ipmask(h, mask > -1 ? mask : 128);
+			err(1, "%s: calloc", __func__);
+		h->af = res->ai_family;
+		copy_satopfaddr(&h->addr.v.a.addr, res->ai_addr);
+		if (h->af == AF_INET6)
+			h->ifindex =
+			    ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
 		freeaddrinfo(res);
-		h->next = NULL;
-		h->tail = h;
+	} else {	/* ie. for 10/8 parsing */
+		if (mask == -1)
+			return (NULL);
+		h = calloc(1, sizeof(*h));
+		if (h == NULL)
+			err(1, "%s: calloc", __func__);
+		h->af = AF_INET;
+		if (inet_net_pton(AF_INET, s, &h->addr.v.a.addr.v4,
+		    sizeof(h->addr.v.a.addr.v4)) == -1) {
+			free(h);
+			return (NULL);
+		}
 	}
+	set_ipmask(h, mask);
+	h->ifname = NULL;
+	h->next = NULL;
+	h->tail = h;
 
 	return (h);
 }
@@ -1822,22 +1778,11 @@ host_dns(const char *s, int mask, int numeric)
 			err(1, "host_dns: calloc");
 		n->ifname = NULL;
 		n->af = res->ai_family;
-		if (res->ai_family == AF_INET) {
-			memcpy(&n->addr.v.a.addr,
-			    &((struct sockaddr_in *)
-			    res->ai_addr)->sin_addr.s_addr,
-			    sizeof(struct in_addr));
-			set_ipmask(n, mask > -1 ? mask : 32);
-		} else {
-			memcpy(&n->addr.v.a.addr,
-			    &((struct sockaddr_in6 *)
-			    res->ai_addr)->sin6_addr.s6_addr,
-			    sizeof(struct in6_addr));
+		copy_satopfaddr(&n->addr.v.a.addr, res->ai_addr);
+		if (res->ai_family == AF_INET6)
 			n->ifindex =
-			    ((struct sockaddr_in6 *)
-			    res->ai_addr)->sin6_scope_id;
-			set_ipmask(n, mask > -1 ? mask : 128);
-		}
+			    ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
+		set_ipmask(n, mask);
 		n->next = NULL;
 		n->tail = n;
 		if (h == NULL)
@@ -1930,7 +1875,7 @@ append_addr_host(struct pfr_buffer *b, struct node_host *n, int test, int not)
 		bzero(&addr, sizeof(addr));
 		addr.pfra_not = n->not ^ not;
 		addr.pfra_af = n->af;
-		addr.pfra_net = unmask(&n->addr.v.a.mask, n->af);
+		addr.pfra_net = unmask(&n->addr.v.a.mask);
 		if (n->ifname) {
 			if (strlcpy(addr.pfra_ifname, n->ifname,
 		 	   sizeof(addr.pfra_ifname)) >= sizeof(addr.pfra_ifname))

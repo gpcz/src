@@ -1,4 +1,4 @@
-/*	$OpenBSD: editor.c,v 1.346 2018/08/28 12:40:54 krw Exp $	*/
+/*	$OpenBSD: editor.c,v 1.349 2018/09/11 09:13:19 krw Exp $	*/
 
 /*
  * Copyright (c) 1997-2000 Todd C. Miller <Todd.Miller@courtesan.com>
@@ -572,6 +572,7 @@ editor_allocspace(struct disklabel *lp_org)
 	index = -1;
 again:
 	free(alloc);
+	alloc = NULL;
 	index++;
 	if (index >= alloc_table_nitems)
 		return 1;
@@ -942,15 +943,6 @@ editor_name(struct disklabel *lp, char *p)
 
 	if (pp->p_fstype == FS_UNUSED && DL_GETPSIZE(pp) == 0) {
 		fprintf(stderr, "Partition '%c' is not in use.\n", p[0]);
-		return;
-	}
-
-	/* Not all fstypes can be named */
-	if (pp->p_fstype == FS_UNUSED || pp->p_fstype == FS_SWAP ||
-	    pp->p_fstype == FS_BOOT || pp->p_fstype == FS_OTHER ||
-	    pp->p_fstype == FS_RAID) {
-		fprintf(stderr, "You cannot name a filesystem of type %s.\n",
-		    fstypenames[lp->d_partitions[partno].p_fstype]);
 		return;
 	}
 
@@ -2124,39 +2116,46 @@ get_mp(struct disklabel *lp, int partno)
 	char *p;
 	int i;
 
-	if (fstabfile && pp->p_fstype != FS_UNUSED &&
-	    pp->p_fstype != FS_SWAP && pp->p_fstype != FS_BOOT &&
-	    pp->p_fstype != FS_OTHER) {
-		for (;;) {
-			p = getstring("mount point",
-			    "Where to mount this filesystem (ie: / /var /usr)",
-			    mountpoints[partno] ? mountpoints[partno] : "none");
-			if (p == NULL)
-				return (1);
-			if (strcasecmp(p, "none") == 0) {
-				free(mountpoints[partno]);
-				mountpoints[partno] = NULL;
-				break;
-			}
-			for (i = 0; i < MAXPARTITIONS; i++)
-				if (mountpoints[i] != NULL && i != partno &&
-				    strcmp(p, mountpoints[i]) == 0)
-					break;
-			if (i < MAXPARTITIONS) {
-				fprintf(stderr, "'%c' already being mounted at "
-				    "'%s'\n", 'a'+i, p);
-				break;
-			}
-			if (*p == '/') {
-				/* XXX - might as well realloc */
-				free(mountpoints[partno]);
-				if ((mountpoints[partno] = strdup(p)) == NULL)
-					errx(4, "out of memory");
-				break;
-			}
-			fputs("Mount points must start with '/'\n", stderr);
-		}
+	if (fstabfile == NULL ||
+	    pp->p_fstype == FS_UNUSED ||
+	    pp->p_fstype == FS_SWAP ||
+	    pp->p_fstype == FS_BOOT ||
+	    pp->p_fstype == FS_OTHER ||
+	    pp->p_fstype == FS_RAID) {
+		/* No fstabfile, no names. Not all fstypes can be named */
+		return 0;
 	}
+
+	for (;;) {
+		p = getstring("mount point",
+		    "Where to mount this filesystem (ie: / /var /usr)",
+		    mountpoints[partno] ? mountpoints[partno] : "none");
+		if (p == NULL)
+			return (1);
+		if (strcasecmp(p, "none") == 0) {
+			free(mountpoints[partno]);
+			mountpoints[partno] = NULL;
+			break;
+		}
+		for (i = 0; i < MAXPARTITIONS; i++)
+			if (mountpoints[i] != NULL && i != partno &&
+			    strcmp(p, mountpoints[i]) == 0)
+				break;
+		if (i < MAXPARTITIONS) {
+			fprintf(stderr, "'%c' already being mounted at "
+			    "'%s'\n", 'a'+i, p);
+			break;
+		}
+		if (*p == '/') {
+			/* XXX - might as well realloc */
+			free(mountpoints[partno]);
+			if ((mountpoints[partno] = strdup(p)) == NULL)
+				errx(4, "out of memory");
+			break;
+		}
+		fputs("Mount points must start with '/'\n", stderr);
+	}
+
 	return (0);
 }
 
@@ -2506,25 +2505,34 @@ alignpartition(struct disklabel *lp, int partno, u_int64_t startalign,
 			break;
 	}
 	if (chunks[i].stop == 0) {
-		fprintf(stderr, "offset %llu is outside the OpenBSD bounds "
-		    "or inside another partition\n", start);
+		fprintf(stderr, "'%c' aligned offset %llu lies outside "
+		    "the OpenBSD bounds or inside another partition\n",
+		    'a' + partno, start);
 		return (1);
 	}
-	maxstop = (chunks[i].stop / stopalign) * stopalign;
 
 	/* Calculate the new 'stop' sector, the sector after the partition. */
+	if ((flags & ROUND_SIZE_OVERLAP) == 0)
+		maxstop = (chunks[i].stop / stopalign) * stopalign;
+	else
+		maxstop = (ending_sector / stopalign) * stopalign;
+
 	stop = DL_GETPOFFSET(pp) + DL_GETPSIZE(pp);
 	if ((flags & ROUND_SIZE_UP) == ROUND_SIZE_UP)
 		stop = ((stop + stopalign - 1) / stopalign) * stopalign;
 	else if ((flags & ROUND_SIZE_DOWN) == ROUND_SIZE_DOWN)
 		stop = (stop / stopalign) * stopalign;
-
-	if (((flags & ROUND_SIZE_OVERLAP) == 0) && stop  > maxstop)
+	if (stop > maxstop)
 		stop = maxstop;
+
+	if (stop <= start) {
+		fprintf(stderr, "'%c' aligned size <= 0\n", 'a' + partno);
+		return (1);
+	}
 
 	if (start != DL_GETPOFFSET(pp))
 		DL_SETPOFFSET(pp, start);
-	if (stop > start && stop != DL_GETPOFFSET(pp) + DL_GETPSIZE(pp))
+	if (stop != DL_GETPOFFSET(pp) + DL_GETPSIZE(pp))
 		DL_SETPSIZE(pp, stop - start);
 
 	return (0);

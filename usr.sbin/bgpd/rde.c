@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde.c,v 1.416 2018/08/29 19:47:47 claudio Exp $ */
+/*	$OpenBSD: rde.c,v 1.423 2018/09/14 10:22:11 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -100,8 +100,10 @@ static void	 rde_softreconfig_unload_peer(struct rib_entry *, void *);
 void		 rde_up_dump_upcall(struct rib_entry *, void *);
 void		 rde_update_queue_runner(void);
 void		 rde_update6_queue_runner(u_int8_t);
-void		 rde_mark_prefixsets_dirty(struct prefixset_head *,
-						struct prefixset_head *);
+struct rde_prefixset *rde_find_prefixset(char *, struct rde_prefixset_head *);
+void		 rde_free_prefixsets(struct rde_prefixset_head *);
+void		 rde_mark_prefixsets_dirty(struct rde_prefixset_head *,
+			struct rde_prefixset_head *);
 
 void		 peer_init(u_int32_t);
 void		 peer_shutdown(void);
@@ -128,7 +130,8 @@ struct bgpd_config	*conf, *nconf;
 time_t			 reloadtime;
 struct rde_peer_head	 peerlist;
 struct rde_peer		*peerself;
-struct prefixset_head	*prefixsets_tmp, *prefixsets_old;
+struct rde_prefixset_head *prefixsets_tmp, *prefixsets_old;
+struct as_set_head	*as_sets_tmp, *as_sets_old;
 struct filter_head	*out_rules, *out_rules_tmp;
 struct rdomain_head	*rdomains_l, *newdomains;
 struct imsgbuf		*ibuf_se;
@@ -571,8 +574,7 @@ badnetdel:
 				log_warnx("rde_dispatch: wrong imsg len");
 				break;
 			}
-			prefix_network_clean(peerself, time(NULL),
-			    F_ANN_DYNAMIC);
+			prefix_network_clean(peerself);
 			break;
 		case IMSG_FILTER_SET:
 			if (imsg.hdr.len - IMSG_HEADER_SIZE !=
@@ -685,8 +687,9 @@ badnetdel:
 void
 rde_dispatch_imsg_parent(struct imsgbuf *ibuf)
 {
+	static struct rde_prefixset	*last_prefixset;
+	static struct as_set	*last_as_set;
 	static struct rdomain	*rd;
-	static struct prefixset	*last_prefixset;
 	struct imsg		 imsg;
 	struct mrt		 xmrt;
 	struct rde_rib		 rn;
@@ -695,8 +698,10 @@ rde_dispatch_imsg_parent(struct imsgbuf *ibuf)
 	struct filter_rule	*r;
 	struct filter_set	*s;
 	struct rib		*rib;
-	struct prefixset	*ps;
-	struct prefixset_item	*psi;
+	struct rde_prefixset	*ps;
+	struct prefixset_item	 psi;
+	char			*name;
+	size_t			 nmemb;
 	int			 n, fd;
 	u_int16_t		 rid;
 
@@ -765,10 +770,15 @@ rde_dispatch_imsg_parent(struct imsgbuf *ibuf)
 				fatalx("IMSG_RECONF_CONF bad len");
 			reloadtime = time(NULL);
 			prefixsets_tmp = calloc(1,
-			    sizeof(struct prefixset_head));
+			    sizeof(struct rde_prefixset_head));
 			if (prefixsets_tmp == NULL)
 				fatal(NULL);
 			SIMPLEQ_INIT(prefixsets_tmp);
+			as_sets_tmp = calloc(1,
+			    sizeof(struct as_set_head));
+			if (as_sets_tmp == NULL)
+				fatal(NULL);
+			SIMPLEQ_INIT(as_sets_tmp);
 			out_rules_tmp = calloc(1, sizeof(struct filter_head));
 			if (out_rules_tmp == NULL)
 				fatal(NULL);
@@ -822,14 +832,25 @@ rde_dispatch_imsg_parent(struct imsgbuf *ibuf)
 				fatal(NULL);
 			memcpy(r, imsg.data, sizeof(struct filter_rule));
 			if (r->match.prefixset.flags != 0) {
-				log_debug("%s: retrieving prefixset %s for "
-				    "rule", __func__, r->match.prefixset.name);
 				r->match.prefixset.ps =
-				    find_prefixset(r->match.prefixset.name,
+				    rde_find_prefixset(r->match.prefixset.name,
 					prefixsets_tmp);
 				if (r->match.prefixset.ps == NULL)
 					log_warnx("%s: no prefixset for %s",
 					    __func__, r->match.prefixset.name);
+			}
+			if (r->match.as.flags & AS_FLAG_AS_SET_NAME) {
+				struct as_set * aset;
+
+				aset = as_sets_lookup(as_sets_tmp,
+				    r->match.as.name);
+				if (aset == NULL) {
+					log_warnx("%s: no as-set for %s",
+					    __func__, r->match.as.name);
+				} else {
+					r->match.as.flags = AS_FLAG_AS_SET;
+					r->match.as.aset = aset;
+				}
 			}
 			TAILQ_INIT(&r->set);
 			if ((rib = rib_find(r->rib)) == NULL) {
@@ -857,27 +878,49 @@ rde_dispatch_imsg_parent(struct imsgbuf *ibuf)
 			break;
 		case IMSG_RECONF_PREFIXSET:
 			if (imsg.hdr.len - IMSG_HEADER_SIZE !=
-			    sizeof(struct prefixset))
+			    sizeof(ps->name))
 				fatalx("IMSG_RECONF_PREFIXSET bad len");
-			ps = malloc(sizeof(struct prefixset));
+			ps = calloc(1, sizeof(struct rde_prefixset));
 			if (ps == NULL)
 				fatal(NULL);
-			memcpy(ps, imsg.data, sizeof(struct prefixset));
-			SIMPLEQ_INIT(&ps->psitems);
+			memcpy(ps->name, imsg.data, sizeof(ps->name));
 			SIMPLEQ_INSERT_TAIL(prefixsets_tmp, ps, entry);
 			last_prefixset = ps;
 			break;
 		case IMSG_RECONF_PREFIXSETITEM:
 			if (imsg.hdr.len - IMSG_HEADER_SIZE !=
-			    sizeof(struct prefixset_item))
+			    sizeof(psi))
 				fatalx("IMSG_RECONF_PREFIXSETITEM bad len");
-			psi = malloc(sizeof(struct prefixset_item));
-			if (psi == NULL)
-				fatal(NULL);
-			memcpy(psi, imsg.data, sizeof(struct prefixset_item));
+			memcpy(&psi, imsg.data, sizeof(psi));
 			if (last_prefixset == NULL)
 				fatalx("King Bula has no prefixset");
-			SIMPLEQ_INSERT_TAIL(&last_prefixset->psitems, psi, entry);
+			if (trie_add(&last_prefixset->th, &psi.p.addr,
+			    psi.p.len, psi.p.len_min, psi.p.len_max) == -1)
+				log_warnx("trie_add(%s) %s/%u, %u-%u) failed",
+				    last_prefixset->name, log_addr(&psi.p.addr),
+				    psi.p.len, psi.p.len_min, psi.p.len_max);
+			break;
+		case IMSG_RECONF_AS_SET:
+			if (imsg.hdr.len - IMSG_HEADER_SIZE !=
+			    sizeof(nmemb) + SET_NAME_LEN)
+				fatalx("IMSG_RECONF_AS_SET bad len");
+			memcpy(&nmemb, imsg.data, sizeof(nmemb));
+			name = (char *)imsg.data + sizeof(nmemb);
+			if (as_sets_lookup(as_sets_tmp, name) != NULL)
+				fatalx("duplicate as-set %s", name);
+			last_as_set = as_set_new(name, nmemb,
+			    sizeof(u_int32_t));
+			break;
+		case IMSG_RECONF_AS_SET_ITEMS:
+			nmemb = imsg.hdr.len - IMSG_HEADER_SIZE;
+			nmemb /= sizeof(u_int32_t);
+			if (as_set_add(last_as_set, imsg.data, nmemb) != 0)
+				fatal(NULL);
+			break;
+		case IMSG_RECONF_AS_SET_DONE:
+			as_set_prep(last_as_set);
+			as_sets_insert(as_sets_tmp, last_as_set);
+			last_as_set = NULL;
 			break;
 		case IMSG_RECONF_RDOMAIN:
 			if (imsg.hdr.len - IMSG_HEADER_SIZE !=
@@ -1314,7 +1357,7 @@ rde_update_update(struct rde_peer *peer, struct filterstate *in,
 
 	peer->prefix_rcvd_update++;
 	/* add original path to the Adj-RIB-In */
-	if (path_update(&ribs[RIB_ADJ_IN].rib, peer, in, prefix, prefixlen, 0))
+	if (path_update(&ribs[RIB_ADJ_IN].rib, peer, in, prefix, prefixlen))
 		peer->prefix_cnt++;
 
 	/* max prefix checker */
@@ -1328,7 +1371,7 @@ rde_update_update(struct rde_peer *peer, struct filterstate *in,
 	if (in->aspath.flags & F_ATTR_PARSE_ERR)
 		wmsg = "path invalid, withdraw";
 
-	p = prefix_get(&ribs[RIB_ADJ_IN].rib, peer, prefix, prefixlen, 0);
+	p = prefix_get(&ribs[RIB_ADJ_IN].rib, peer, prefix, prefixlen);
 	if (p == NULL)
 		fatalx("rde_update_update: no prefix in Adj-RIB-In");
 
@@ -1345,9 +1388,9 @@ rde_update_update(struct rde_peer *peer, struct filterstate *in,
 			    &state.nexthop->exit_nexthop, prefix,
 			    prefixlen);
 			path_update(&ribs[i].rib, peer, &state, prefix,
-			    prefixlen, 0);
-		} else if (prefix_remove(&ribs[i].rib, peer, prefix, prefixlen,
-		    0)) {
+			    prefixlen);
+		} else if (prefix_remove(&ribs[i].rib, peer, prefix,
+		    prefixlen)) {
 			rde_update_log(wmsg, i, peer,
 			    NULL, prefix, prefixlen);
 		}
@@ -1367,13 +1410,13 @@ rde_update_withdraw(struct rde_peer *peer, struct bgpd_addr *prefix,
 	for (i = RIB_LOC_START; i < rib_size; i++) {
 		if (!rib_valid(i))
 			break;
-		if (prefix_remove(&ribs[i].rib, peer, prefix, prefixlen, 0))
+		if (prefix_remove(&ribs[i].rib, peer, prefix, prefixlen))
 			rde_update_log("withdraw", i, peer, NULL, prefix,
 			    prefixlen);
 	}
 
 	/* remove original path form the Adj-RIB-In */
-	if (prefix_remove(&ribs[RIB_ADJ_IN].rib, peer, prefix, prefixlen, 0))
+	if (prefix_remove(&ribs[RIB_ADJ_IN].rib, peer, prefix, prefixlen))
 		peer->prefix_cnt--;
 
 	peer->prefix_rcvd_withdraw++;
@@ -1583,6 +1626,9 @@ bad_flags:
 		/* 4-byte ready server take the default route */
 		goto optattr;
 	case ATTR_COMMUNITIES:
+		if (!CHECK_FLAGS(flags, ATTR_OPTIONAL|ATTR_TRANSITIVE,
+		    ATTR_PARTIAL))
+			goto bad_flags;
 		if (attr_len == 0 || attr_len % 4 != 0) {
 			/*
 			 * mark update as bad and withdraw all routes as per
@@ -1591,12 +1637,13 @@ bad_flags:
 			a->flags |= F_ATTR_PARSE_ERR;
 			log_peer_warnx(&peer->conf, "bad COMMUNITIES, "
 			    "path invalidated and prefix withdrawn");
+			break;
 		}
+		goto optattr;
+	case ATTR_LARGE_COMMUNITIES:
 		if (!CHECK_FLAGS(flags, ATTR_OPTIONAL|ATTR_TRANSITIVE,
 		    ATTR_PARTIAL))
 			goto bad_flags;
-		goto optattr;
-	case ATTR_LARGE_COMMUNITIES:
 		if (attr_len == 0 || attr_len % 12 != 0) {
 			/*
 			 * mark update as bad and withdraw all routes as per
@@ -1605,12 +1652,13 @@ bad_flags:
 			a->flags |= F_ATTR_PARSE_ERR;
 			log_peer_warnx(&peer->conf, "bad LARGE COMMUNITIES, "
 			    "path invalidated and prefix withdrawn");
+			break;
 		}
+		goto optattr;
+	case ATTR_EXT_COMMUNITIES:
 		if (!CHECK_FLAGS(flags, ATTR_OPTIONAL|ATTR_TRANSITIVE,
 		    ATTR_PARTIAL))
 			goto bad_flags;
-		goto optattr;
-	case ATTR_EXT_COMMUNITIES:
 		if (attr_len == 0 || attr_len % 8 != 0) {
 			/*
 			 * mark update as bad and withdraw all routes as per
@@ -1619,10 +1667,8 @@ bad_flags:
 			a->flags |= F_ATTR_PARSE_ERR;
 			log_peer_warnx(&peer->conf, "bad EXT_COMMUNITIES, "
 			    "path invalidated and prefix withdrawn");
+			break;
 		}
-		if (!CHECK_FLAGS(flags, ATTR_OPTIONAL|ATTR_TRANSITIVE,
-		    ATTR_PARTIAL))
-			goto bad_flags;
 		goto optattr;
 	case ATTR_ORIGINATOR_ID:
 		if (attr_len != 4)
@@ -2168,7 +2214,7 @@ rde_dump_filter(struct prefix *p, struct ctl_show_rib_request *req)
 			return;
 		if (req->type == IMSG_CTL_SHOW_RIB_AS &&
 		    !aspath_match(asp->aspath->data, asp->aspath->len,
-		    &req->as, req->as.as))
+		    &req->as, 0))
 			return;
 		if (req->type == IMSG_CTL_SHOW_RIB_COMMUNITY &&
 		    !community_match(asp, req->community.as,
@@ -2749,12 +2795,14 @@ rde_reload_done(void)
 			nconf->flags &= ~BGPD_FLAG_NO_EVALUATE;
 	}
 
-	prefixsets_old = conf->prefixsets;
+	prefixsets_old = conf->rde_prefixsets;
+	as_sets_old = conf->as_sets;
 
 	memcpy(conf, nconf, sizeof(struct bgpd_config));
 	conf->listen_addrs = NULL;
 	conf->csock = NULL;
 	conf->rcsock = NULL;
+	conf->prefixsets = NULL;
 	free(nconf);
 	nconf = NULL;
 
@@ -2779,9 +2827,14 @@ rde_reload_done(void)
 	/* XXX WHERE IS THE SYNC ??? */
 
 	rde_mark_prefixsets_dirty(prefixsets_old, prefixsets_tmp);
+	as_sets_mark_dirty(as_sets_old, as_sets_tmp);
+
 	/* swap the prefixsets */
-	conf->prefixsets = prefixsets_tmp;
+	conf->rde_prefixsets = prefixsets_tmp;
 	prefixsets_tmp = NULL;
+	/* and the as_sets */
+	conf->as_sets = as_sets_tmp;
+	as_sets_tmp = NULL;
 
 	/*
 	 * make the new filter rules the active one but keep the old for
@@ -2809,8 +2862,7 @@ rde_reload_done(void)
 			peer->reconf_rib = 1;
 			continue;
 		}
-		if (!rde_filter_equal(out_rules, out_rules_tmp, peer,
-		    conf->prefixsets)) {
+		if (!rde_filter_equal(out_rules, out_rules_tmp, peer)) {
 			char *p = log_fmt_peer(&peer->conf);
 			log_debug("out filter change: reloading peer %s", p);
 			free(p);
@@ -2834,7 +2886,7 @@ rde_reload_done(void)
 			break;
 		case RECONF_KEEP:
 			if (rde_filter_equal(ribs[rid].in_rules,
-			    ribs[rid].in_rules_tmp, NULL, conf->prefixsets))
+			    ribs[rid].in_rules_tmp, NULL))
 				/* rib is in sync */
 				break;
 			log_debug("in filter change: reloading RIB %s",
@@ -2880,7 +2932,7 @@ rde_reload_runner(void)
 	u_int16_t	rid;
 
 	for (rid = 0; rid < rib_size; rid++) {
-		if (*ribs[rid].name == '\0')
+		if (!rib_valid(rid))
 			continue;
 		if (ribs[rid].dumping)
 			rib_dump_r(&ribs[rid].ribctx);
@@ -2900,7 +2952,7 @@ rde_softreconfig_in_done(void *arg)
 
 	/* now do the Adj-RIB-Out sync */
 	for (rid = 0; rid < rib_size; rid++) {
-		if (*ribs[rid].name == '\0')
+		if (!rib_valid(rid))
 			continue;
 		ribs[rid].state = RECONF_NONE;
 	}
@@ -2914,7 +2966,7 @@ rde_softreconfig_in_done(void *arg)
 	}
 
 	for (rid = 0; rid < rib_size; rid++) {
-		if (*ribs[rid].name == '\0')
+		if (!rib_valid(rid))
 			continue;
 		if (ribs[rid].state == RECONF_RELOAD) {
 			struct rib_context	*ctx;
@@ -2969,8 +3021,10 @@ rde_softreconfig_done(void)
 		ribs[rid].state = RECONF_NONE;
 	}
 
-	free_prefixsets(prefixsets_old);
+	rde_free_prefixsets(prefixsets_old);
 	prefixsets_old = NULL;
+	as_sets_free(as_sets_old);
+	as_sets_old = NULL;
 
 	log_info("RDE soft reconfiguration done");
 	imsg_compose(ibuf_main, IMSG_RECONF_DONE, 0, 0,
@@ -3014,11 +3068,11 @@ rde_softreconfig_in(struct rib_entry *re, void *bula)
 			if (action == ACTION_ALLOW) {
 				/* update Local-RIB */
 				path_update(&rib->rib, peer, &state, &addr,
-				    pt->prefixlen, 0);
+				    pt->prefixlen);
 			} else if (action == ACTION_DENY) {
 				/* remove from Local-RIB */
 				prefix_remove(&rib->rib, peer, &addr,
-				    pt->prefixlen, 0);
+				    pt->prefixlen);
 			}
 
 			rde_filterstate_clean(&state);
@@ -3583,7 +3637,7 @@ network_add(struct network_config *nc, int flagstatic)
 		    peerself);
 
 	if (path_update(&ribs[RIB_ADJ_IN].rib, peerself, &state, &nc->prefix,
-		    nc->prefixlen, 0))
+		    nc->prefixlen))
 		peerself->prefix_cnt++;
 	for (i = RIB_LOC_START; i < rib_size; i++) {
 		if (!rib_valid(i))
@@ -3592,7 +3646,7 @@ network_add(struct network_config *nc, int flagstatic)
 		    state.nexthop ? &state.nexthop->exit_nexthop : NULL,
 		    &nc->prefix, nc->prefixlen);
 		path_update(&ribs[i].rib, peerself, &state, &nc->prefix,
-		    nc->prefixlen, 0);
+		    nc->prefixlen);
 	}
 	rde_filterstate_clean(&state);
 	path_put(asp);
@@ -3641,13 +3695,13 @@ network_delete(struct network_config *nc, int flagstatic)
 		if (!rib_valid(i))
 			break;
 		if (prefix_remove(&ribs[i].rib, peerself, &nc->prefix,
-		    nc->prefixlen, flags))
+		    nc->prefixlen))
 			rde_update_log("withdraw announce", i, peerself,
 			    NULL, &nc->prefix, nc->prefixlen);
 
 	}
 	if (prefix_remove(&ribs[RIB_ADJ_IN].rib, peerself, &nc->prefix,
-	    nc->prefixlen, flags))
+	    nc->prefixlen))
 		peerself->prefix_cnt--;	
 }
 
@@ -3758,26 +3812,47 @@ sa_cmp(struct bgpd_addr *a, struct sockaddr *b)
 	return (0);
 }
 
-void
-rde_mark_prefixsets_dirty(struct prefixset_head *psold,
-    struct prefixset_head *psnew)
+struct rde_prefixset *
+rde_find_prefixset(char *name, struct rde_prefixset_head *p)
 {
-	struct prefixset *new, *fps;
-	struct prefixset_item *item;
+	struct rde_prefixset *ps;
+
+	SIMPLEQ_FOREACH(ps, p, entry) {
+		if (!strcmp(ps->name, name))
+			return (ps);
+	}
+	return (NULL);
+}
+
+void
+rde_free_prefixsets(struct rde_prefixset_head *psh)
+{
+	struct rde_prefixset	*ps;
+
+	if (psh == NULL)
+		return;
+
+	while (!SIMPLEQ_EMPTY(psh)) {
+		ps = SIMPLEQ_FIRST(psh);
+		trie_free(&ps->th);
+		SIMPLEQ_REMOVE_HEAD(psh, entry);
+		free(ps);
+	}
+}
+
+void
+rde_mark_prefixsets_dirty(struct rde_prefixset_head *psold,
+    struct rde_prefixset_head *psnew)
+{
+	struct rde_prefixset *new, *old;
 
 	SIMPLEQ_FOREACH(new, psnew, entry) {
 		if ((psold == NULL) ||
-		    (fps = find_prefixset(new->name, psold)) == NULL) {
-			new->sflags |= PREFIXSET_FLAG_DIRTY;
+		    (old = rde_find_prefixset(new->name, psold)) == NULL) {
+			new->dirty = 1;
 		} else {
-			SIMPLEQ_FOREACH(item, &new->psitems, entry) {
-				if (find_prefixsetitem(item, &fps->psitems)
-				    == NULL) {
-					new->sflags |= PREFIXSET_FLAG_DIRTY;
-					break;
-				}
-			}
+			if (trie_equal(&new->th, &old->th) == 0)
+				new->dirty = 1;
 		}
 	}
-	return;
 }

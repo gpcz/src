@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_locl.h,v 1.211 2018/08/27 17:11:32 jsing Exp $ */
+/* $OpenBSD: ssl_locl.h,v 1.215 2018/09/08 14:29:52 jsing Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -264,10 +264,6 @@ __BEGIN_HIDDEN_DECLS
 #define SSL_HANDSHAKE_MAC_STREEBOG256	0x200
 #define SSL_HANDSHAKE_MAC_DEFAULT (SSL_HANDSHAKE_MAC_MD5 | SSL_HANDSHAKE_MAC_SHA)
 
-/* When adding new digest in the ssl_ciph.c and increment SSM_MD_NUM_IDX
- * make sure to update this constant too */
-#define SSL_MAX_DIGEST 7
-
 #define SSL3_CK_ID		0x03000000
 #define SSL3_CK_VALUE_MASK	0x0000ffff
 
@@ -282,8 +278,10 @@ __BEGIN_HIDDEN_DECLS
 #define TLS1_PRF_STREEBOG256 (SSL_HANDSHAKE_MAC_STREEBOG256 << TLS1_PRF_DGST_SHIFT)
 #define TLS1_PRF (TLS1_PRF_MD5 | TLS1_PRF_SHA1)
 
-/* Stream MAC for GOST ciphersuites from cryptopro draft
- * (currently this also goes into algorithm2) */
+/*
+ * Stream MAC for GOST ciphersuites from cryptopro draft
+ * (currently this also goes into algorithm2).
+ */
 #define TLS1_STREAM_MAC 0x04
 
 /*
@@ -294,14 +292,8 @@ __BEGIN_HIDDEN_DECLS
 #define SSL_CIPHER_ALGORITHM2_VARIABLE_NONCE_IN_RECORD (1 << 22)
 
 /*
- * SSL_CIPHER_ALGORITHM2_AEAD is an algorithm2 flag that indicates the cipher
- * is implemented via an EVP_AEAD.
- */
-#define SSL_CIPHER_ALGORITHM2_AEAD (1 << 23)
-
-/*
  * SSL_CIPHER_AEAD_FIXED_NONCE_LEN returns the number of bytes of fixed nonce
- * for an SSL_CIPHER with the SSL_CIPHER_ALGORITHM2_AEAD flag.
+ * for an SSL_CIPHER with an algorithm_mac of SSL_AEAD.
  */
 #define SSL_CIPHER_AEAD_FIXED_NONCE_LEN(ssl_cipher) \
 	(((ssl_cipher->algorithm2 >> 24) & 0xf) * 2)
@@ -379,7 +371,6 @@ typedef struct ssl_method_internal_st {
 
 	int (*ssl_accept)(SSL *s);
 	int (*ssl_connect)(SSL *s);
-	int (*ssl_shutdown)(SSL *s);
 
 	int (*ssl_renegotiate)(SSL *s);
 	int (*ssl_renegotiate_check)(SSL *s);
@@ -390,7 +381,6 @@ typedef struct ssl_method_internal_st {
 	    int len, int peek);
 	int (*ssl_write_bytes)(SSL *s, int type, const void *buf_, int len);
 
-	int (*ssl_pending)(const SSL *s);
 	const struct ssl_method_st *(*get_ssl_method)(int version);
 
 	long (*get_timeout)(void);
@@ -1041,7 +1031,9 @@ extern SSL3_ENC_METHOD TLSv1_enc_data;
 extern SSL3_ENC_METHOD TLSv1_1_enc_data;
 extern SSL3_ENC_METHOD TLSv1_2_enc_data;
 
-void ssl_clear_cipher_ctx(SSL *s);
+void ssl_clear_cipher_state(SSL *s);
+void ssl_clear_cipher_read_state(SSL *s);
+void ssl_clear_cipher_write_state(SSL *s);
 int ssl_clear_bad_session(SSL *s);
 CERT *ssl_cert_new(void);
 CERT *ssl_cert_dup(CERT *cert);
@@ -1221,7 +1213,6 @@ int dtls1_new(SSL *s);
 void dtls1_free(SSL *s);
 void dtls1_clear(SSL *s);
 long dtls1_ctrl(SSL *s, int cmd, long larg, void *parg);
-int dtls1_shutdown(SSL *s);
 
 long dtls1_get_message(SSL *s, int st1, int stn, int mt, long max, int *ok);
 int dtls1_get_record(SSL *s);
@@ -1282,7 +1273,6 @@ int tls12_get_sigid(const EVP_PKEY *pk);
 int tls12_get_hashandsig(CBB *cbb, const EVP_PKEY *pk, const EVP_MD *md);
 const EVP_MD *tls12_get_hash(unsigned char hash_alg);
 
-void ssl_clear_hash_ctx(EVP_MD_CTX **hash);
 long ssl_get_algorithm2(SSL *s);
 int tls1_process_sigalgs(SSL *s, CBS *cbs);
 void tls12_get_req_sig_algs(SSL *s, unsigned char **sigalgs,

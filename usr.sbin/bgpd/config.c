@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.70 2018/08/02 12:46:02 claudio Exp $ */
+/*	$OpenBSD: config.c,v 1.73 2018/09/09 11:00:51 benno Exp $ */
 
 /*
  * Copyright (c) 2003, 2004, 2005 Henning Brauer <henning@openbsd.org>
@@ -67,6 +67,8 @@ new_config(void)
 	if ((conf->prefixsets = calloc(1, sizeof(struct prefixset_head)))
 	    == NULL)
 		fatal(NULL);
+	if ((conf->as_sets = calloc(1, sizeof(struct as_set_head))) == NULL)
+		fatal(NULL);
 	if ((conf->filters = calloc(1, sizeof(struct filter_head))) == NULL)
 		fatal(NULL);
 	if ((conf->listen_addrs = calloc(1, sizeof(struct listen_addrs))) ==
@@ -79,6 +81,7 @@ new_config(void)
 	TAILQ_INIT(&conf->networks);
 	SIMPLEQ_INIT(&conf->rdomains);
 	SIMPLEQ_INIT(conf->prefixsets);
+	SIMPLEQ_INIT(conf->as_sets);
 
 	TAILQ_INIT(conf->filters);
 	TAILQ_INIT(conf->listen_addrs);
@@ -132,6 +135,7 @@ free_prefixsets(struct prefixset_head *psh)
 		SIMPLEQ_REMOVE_HEAD(psh, entry);
 		free(ps);
 	}
+	free(psh);
 }
 
 void
@@ -144,6 +148,7 @@ free_config(struct bgpd_config *conf)
 	free_networks(&conf->networks);
 	filterlist_free(conf->filters);
 	free_prefixsets(conf->prefixsets);
+	as_sets_free(conf->as_sets);
 
 	while ((la = TAILQ_FIRST(conf->listen_addrs)) != NULL) {
 		TAILQ_REMOVE(conf->listen_addrs, la, entry);
@@ -169,8 +174,6 @@ merge_config(struct bgpd_config *xconf, struct bgpd_config *conf,
 {
 	struct listen_addr	*nla, *ola, *next;
 	struct network		*n;
-	struct rdomain		*rd;
-	struct prefixset	*ps;
 
 	/*
 	 * merge the freshly parsed conf into the running xconf
@@ -220,10 +223,14 @@ merge_config(struct bgpd_config *xconf, struct bgpd_config *conf,
 
 	/* switch the prefixsets, first remove the old ones */
 	free_prefixsets(xconf->prefixsets);
-	while ((ps = SIMPLEQ_FIRST(conf->prefixsets)) != NULL) {
-		SIMPLEQ_REMOVE_HEAD(conf->prefixsets, entry);
-		SIMPLEQ_INSERT_TAIL(xconf->prefixsets, ps, entry);
-	}
+	xconf->prefixsets = conf->prefixsets;
+	conf->prefixsets = NULL;
+
+	/* switch the as_sets, first remove the old ones */
+	as_sets_free(xconf->as_sets);
+	xconf->as_sets = conf->as_sets;
+	conf->as_sets = NULL;
+
 	/* switch the network statements, but first remove the old ones */
 	free_networks(&xconf->networks);
 	while ((n = TAILQ_FIRST(&conf->networks)) != NULL) {
@@ -233,10 +240,7 @@ merge_config(struct bgpd_config *xconf, struct bgpd_config *conf,
 
 	/* switch the rdomain configs, first remove the old ones */
 	free_rdomains(&xconf->rdomains);
-	while ((rd = SIMPLEQ_FIRST(&conf->rdomains)) != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&conf->rdomains, entry);
-		SIMPLEQ_INSERT_TAIL(&xconf->rdomains, rd, entry);
-	}
+	SIMPLEQ_CONCAT(&xconf->rdomains, &conf->rdomains);
 
 	/*
 	 * merge new listeners:
@@ -353,10 +357,9 @@ host(const char *s, struct bgpd_addr *h, u_int8_t *len)
 int
 host_v4(const char *s, struct bgpd_addr *h, u_int8_t *len)
 {
-	struct in_addr		 ina;
+	struct in_addr		 ina = { 0 };
 	int			 bits = 32;
 
-	bzero(&ina, sizeof(struct in_addr));
 	if (strrchr(s, '/') != NULL) {
 		if ((bits = inet_net_pton(AF_INET, s, &ina, sizeof(ina))) == -1)
 			return (0);
@@ -493,4 +496,53 @@ get_mpe_label(struct rdomain *r)
 	close(s);
 	r->label = shim.shim_label;
 	return (0);
+}
+
+void
+copy_filterset(struct filter_set_head *source, struct filter_set_head *dest)
+{
+	struct filter_set	*s, *t;
+
+	if (source == NULL)
+		return;
+
+	TAILQ_FOREACH(s, source, entry) {
+		if ((t = malloc(sizeof(struct filter_set))) == NULL)
+			fatal(NULL);
+		memcpy(t, s, sizeof(struct filter_set));
+		TAILQ_INSERT_TAIL(dest, t, entry);
+	}
+}
+
+void
+expand_networks(struct bgpd_config *c)
+{
+	struct network		*n, *m, *tmp;
+	struct network_head	*nw = &c->networks;
+	struct prefixset	*ps;
+	struct prefixset_item	*psi;
+
+	TAILQ_FOREACH_SAFE(n, nw, entry, tmp) {
+		if (n->net.type == NETWORK_PREFIXSET) {
+			TAILQ_REMOVE(nw, n, entry);
+			if ((ps = find_prefixset(n->net.psname, c->prefixsets))
+			    == NULL)
+				fatal("%s: prefixset %s not found", __func__,
+				    n->net.psname);
+			SIMPLEQ_FOREACH(psi, &ps->psitems, entry) {
+				if ((m = calloc(1, sizeof(struct network)))
+				    == NULL)
+					fatal(NULL);
+				memcpy(&m->net.prefix, &psi->p.addr,
+				    sizeof(m->net.prefix));
+				m->net.prefixlen = psi->p.len;
+				TAILQ_INIT(&m->net.attrset);
+				copy_filterset(&n->net.attrset,
+				    &m->net.attrset);
+				TAILQ_INSERT_TAIL(nw, m, entry);
+			}
+			filterset_free(&n->net.attrset);
+			free(n);
+		}
+	}
 }
